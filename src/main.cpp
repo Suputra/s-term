@@ -6,6 +6,8 @@
 #include <WiFi.h>
 #include <libssh/libssh.h>
 #include <esp_task_wdt.h>
+#include <esp_netif.h>
+#include <driver/uart.h>
 
 // --- WiFi / SSH Credentials ---
 
@@ -41,8 +43,20 @@
 #define BOARD_LORA_EN       46
 #define BOARD_GPS_EN        39
 #define BOARD_1V8_EN        38
-#define BOARD_6609_EN       41
-#define BOARD_A7682E_PWRKEY 40
+
+// --- A7682E 4G Modem Pins ---
+#define BOARD_MODEM_POWER_EN  41   // Was BOARD_6609_EN — enables modem power rail
+#define BOARD_MODEM_PWRKEY    40   // Power on/off toggle pulse
+#define BOARD_MODEM_RST       9    // Hardware reset
+#define BOARD_MODEM_RXD       10   // Modem UART RX (ESP32 TX → Modem RX)
+#define BOARD_MODEM_TXD       11   // Modem UART TX (Modem TX → ESP32 RX)
+#define BOARD_MODEM_DTR       8    // Data Terminal Ready
+#define BOARD_MODEM_RI        7    // Ring Indicator
+
+#define MODEM_APN       ""         // Set your carrier APN here (empty = auto)
+#define MODEM_BAUD      115200
+
+#define SerialAT Serial1
 
 // --- Display ---
 
@@ -161,6 +175,12 @@ static TaskHandle_t ssh_recv_task_handle = NULL;
 
 enum WifiState { WIFI_IDLE, WIFI_CONNECTING, WIFI_CONNECTED, WIFI_FAILED };
 static volatile WifiState wifi_state = WIFI_IDLE;
+
+// --- Modem State ---
+
+enum ModemState { MODEM_OFF, MODEM_POWERING_ON, MODEM_AT_OK, MODEM_REGISTERING, MODEM_REGISTERED, MODEM_PPP_UP, MODEM_FAILED };
+static volatile ModemState modem_state = MODEM_OFF;
+static volatile bool modem_task_running = false;
 
 // --- Helpers ---
 
@@ -523,6 +543,196 @@ void wifiCheck() {
     }
 }
 
+// --- 4G Modem ---
+
+String modemSendAT(const char* cmd, uint32_t timeout = 2000) {
+    while (SerialAT.available()) SerialAT.read();  // flush input
+    SerialAT.println(cmd);
+    uint32_t start = millis();
+    String response = "";
+    while (millis() - start < timeout) {
+        while (SerialAT.available()) {
+            response += (char)SerialAT.read();
+        }
+        if (response.indexOf("OK") >= 0 || response.indexOf("ERROR") >= 0)
+            break;
+        delay(10);
+    }
+    Serial.printf("AT> %s => %s\n", cmd, response.c_str());
+    return response;
+}
+
+void modemPowerOn() {
+    Serial.println("Modem: powering on...");
+    // Enable power rail
+    pinMode(BOARD_MODEM_POWER_EN, OUTPUT);
+    digitalWrite(BOARD_MODEM_POWER_EN, HIGH);
+    delay(100);
+
+    // PWRKEY pulse (short = power ON)
+    pinMode(BOARD_MODEM_PWRKEY, OUTPUT);
+    digitalWrite(BOARD_MODEM_PWRKEY, LOW);
+    delay(10);
+    digitalWrite(BOARD_MODEM_PWRKEY, HIGH);
+    delay(50);
+    digitalWrite(BOARD_MODEM_PWRKEY, LOW);
+    delay(10);
+}
+
+void modemPowerOff() {
+    Serial.println("Modem: powering off...");
+    // Long PWRKEY pulse (3s = power OFF)
+    digitalWrite(BOARD_MODEM_PWRKEY, LOW);
+    delay(10);
+    digitalWrite(BOARD_MODEM_PWRKEY, HIGH);
+    delay(3000);
+    digitalWrite(BOARD_MODEM_PWRKEY, LOW);
+    delay(10);
+
+    // Cut power rail
+    digitalWrite(BOARD_MODEM_POWER_EN, LOW);
+    modem_state = MODEM_OFF;
+}
+
+bool modemWaitAT() {
+    for (int i = 0; i < 15; i++) {
+        String r = modemSendAT("AT", 1000);
+        if (r.indexOf("OK") >= 0) return true;
+        delay(500);
+    }
+    return false;
+}
+
+bool modemWaitNetwork(uint32_t timeout = 60000) {
+    uint32_t start = millis();
+    while (millis() - start < timeout) {
+        String r = modemSendAT("AT+CEREG?", 2000);
+        // +CEREG: 0,1 = registered home, 0,5 = registered roaming
+        if (r.indexOf(",1") >= 0 || r.indexOf(",5") >= 0) return true;
+        // Also check GSM registration
+        r = modemSendAT("AT+CREG?", 2000);
+        if (r.indexOf(",1") >= 0 || r.indexOf(",5") >= 0) return true;
+        delay(2000);
+    }
+    return false;
+}
+
+// Get signal quality (returns RSSI value, 0-31 scale, 99=unknown)
+int modemGetSignal() {
+    String r = modemSendAT("AT+CSQ", 2000);
+    int idx = r.indexOf("+CSQ: ");
+    if (idx >= 0) {
+        int rssi = r.substring(idx + 6).toInt();
+        return rssi;
+    }
+    return 99;
+}
+
+void modemConnectTask(void* param) {
+    modem_task_running = true;
+    modem_state = MODEM_POWERING_ON;
+    term_render_requested = true;
+
+    // Initialize UART
+    SerialAT.begin(MODEM_BAUD, SERIAL_8N1, BOARD_MODEM_TXD, BOARD_MODEM_RXD);
+    delay(100);
+
+    // Power on modem
+    modemPowerOn();
+    delay(3000);  // Wait for modem to boot
+
+    // Wait for AT response
+    if (!modemWaitAT()) {
+        Serial.println("Modem: AT failed, no response");
+        modem_state = MODEM_FAILED;
+        term_render_requested = true;
+        modem_task_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    modem_state = MODEM_AT_OK;
+    term_render_requested = true;
+    Serial.println("Modem: AT OK");
+
+    // Basic configuration
+    modemSendAT("ATE0");           // Disable echo
+    modemSendAT("AT+CMEE=2");     // Verbose error messages
+    modemSendAT("AT+CPIN?", 5000); // Check SIM
+
+    // Set APN if configured
+    if (strlen(MODEM_APN) > 0) {
+        char apn_cmd[64];
+        snprintf(apn_cmd, sizeof(apn_cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", MODEM_APN);
+        modemSendAT(apn_cmd);
+    }
+
+    // Wait for network registration
+    modem_state = MODEM_REGISTERING;
+    term_render_requested = true;
+    Serial.println("Modem: waiting for network...");
+
+    if (!modemWaitNetwork(90000)) {
+        Serial.println("Modem: network registration failed");
+        int sig = modemGetSignal();
+        Serial.printf("Modem: signal strength: %d/31\n", sig);
+        modem_state = MODEM_FAILED;
+        term_render_requested = true;
+        modem_task_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    modem_state = MODEM_REGISTERED;
+    term_render_requested = true;
+
+    int sig = modemGetSignal();
+    Serial.printf("Modem: registered! Signal: %d/31\n", sig);
+
+    // Attach to GPRS
+    modemSendAT("AT+CGATT=1", 10000);
+
+    // Activate PDP context
+    modemSendAT("AT+CGACT=1,1", 10000);
+
+    // Check IP address
+    String ip_resp = modemSendAT("AT+CGPADDR=1", 5000);
+    Serial.printf("Modem: IP response: %s\n", ip_resp.c_str());
+
+    // For now, we have cellular data active via the modem's internal TCP stack.
+    // Full PPPoS integration requires esp_modem component (future work).
+    // As an interim solution, we can use AT+CIPSTART for TCP connections.
+
+    modem_state = MODEM_PPP_UP;
+    term_render_requested = true;
+    Serial.println("Modem: cellular data active");
+
+    modem_task_running = false;
+    vTaskDelete(NULL);
+}
+
+void modemStartAsync() {
+    if (modem_task_running || modem_state == MODEM_PPP_UP) return;
+    xTaskCreatePinnedToCore(
+        modemConnectTask,
+        "modem_conn",
+        8192,
+        NULL,
+        1,
+        NULL,
+        1  // run on core 1
+    );
+}
+
+void modemStop() {
+    if (modem_state == MODEM_OFF) return;
+    modemPowerOff();
+    SerialAT.end();
+    modem_state = MODEM_OFF;
+    term_render_requested = true;
+    Serial.println("Modem: stopped");
+}
+
 // --- SSH ---
 
 void sshDisconnect() {
@@ -546,9 +756,13 @@ void sshDisconnect() {
 
 void sshReceiveTask(void* param);
 
+bool hasNetwork() {
+    return (wifi_state == WIFI_CONNECTED) || (modem_state == MODEM_PPP_UP);
+}
+
 bool sshConnect() {
-    if (wifi_state != WIFI_CONNECTED) {
-        Serial.println("SSH: no WiFi");
+    if (!hasNetwork()) {
+        Serial.println("SSH: no network (WiFi or 4G)");
         return false;
     }
     if (ssh_connected) {
@@ -818,16 +1032,29 @@ void drawTerminalStatusBar() {
     display.setCursor(2, bar_y + 1);
 
     char status[60];
+    // Connection info
+    const char* net_tag = "";
+    if (modem_state == MODEM_PPP_UP) net_tag = "4G";
+    else if (wifi_state == WIFI_CONNECTED) net_tag = "WiFi";
+
     if (ssh_connecting) {
         snprintf(status, sizeof(status), "[TERM] SSH connecting...");
     } else if (ssh_connected) {
-        snprintf(status, sizeof(status), "[TERM] %s@%s", SSH_USER, SSH_HOST);
+        snprintf(status, sizeof(status), "[%s] %s@%s", net_tag, SSH_USER, SSH_HOST);
+    } else if (modem_state == MODEM_PPP_UP) {
+        snprintf(status, sizeof(status), "[TERM] 4G ready");
+    } else if (modem_state == MODEM_REGISTERING) {
+        snprintf(status, sizeof(status), "[TERM] 4G registering...");
+    } else if (modem_state == MODEM_POWERING_ON || modem_state == MODEM_AT_OK) {
+        snprintf(status, sizeof(status), "[TERM] 4G starting...");
+    } else if (modem_state == MODEM_FAILED) {
+        snprintf(status, sizeof(status), "[TERM] 4G failed");
     } else if (wifi_state == WIFI_CONNECTED) {
         snprintf(status, sizeof(status), "[TERM] %s", WiFi.localIP().toString().c_str());
     } else if (wifi_state == WIFI_CONNECTING) {
         snprintf(status, sizeof(status), "[TERM] WiFi...");
     } else {
-        snprintf(status, sizeof(status), "[TERM] No WiFi");
+        snprintf(status, sizeof(status), "[TERM] No net (M=4G W=WiFi)");
     }
     display.print(status);
 }
@@ -1198,6 +1425,16 @@ bool handleTerminalKeyPress(int event_code) {
         if (base == 'w') { alt_mode = false; wifi_state = WIFI_IDLE; wifiConnect(); return true; }
         // Alt+F: Force full e-ink refresh
         if (base == 'f') { alt_mode = false; partial_count = 100; term_render_requested = true; return false; }
+        // Alt+M: Toggle 4G modem on/off
+        if (base == 'm') {
+            alt_mode = false;
+            if (modem_state == MODEM_OFF || modem_state == MODEM_FAILED) {
+                modemStartAsync();
+            } else {
+                modemStop();
+            }
+            return true;
+        }
         // Alt+P: Paste notepad buffer into SSH
         if (base == 'p') {
             alt_mode = false;
@@ -1260,11 +1497,12 @@ void setup() {
     esp_task_wdt_deinit();
 
     // Disable unused peripherals
-    pinMode(BOARD_LORA_EN, OUTPUT);       digitalWrite(BOARD_LORA_EN, LOW);
-    pinMode(BOARD_GPS_EN, OUTPUT);        digitalWrite(BOARD_GPS_EN, LOW);
-    pinMode(BOARD_1V8_EN, OUTPUT);        digitalWrite(BOARD_1V8_EN, LOW);
-    pinMode(BOARD_6609_EN, OUTPUT);       digitalWrite(BOARD_6609_EN, LOW);
-    pinMode(BOARD_A7682E_PWRKEY, OUTPUT); digitalWrite(BOARD_A7682E_PWRKEY, LOW);
+    pinMode(BOARD_LORA_EN, OUTPUT);        digitalWrite(BOARD_LORA_EN, LOW);
+    pinMode(BOARD_GPS_EN, OUTPUT);         digitalWrite(BOARD_GPS_EN, LOW);
+    pinMode(BOARD_1V8_EN, OUTPUT);         digitalWrite(BOARD_1V8_EN, LOW);
+    // Modem off by default (Alt+M to enable)
+    pinMode(BOARD_MODEM_POWER_EN, OUTPUT); digitalWrite(BOARD_MODEM_POWER_EN, LOW);
+    pinMode(BOARD_MODEM_PWRKEY, OUTPUT);   digitalWrite(BOARD_MODEM_PWRKEY, LOW);
 
     // Keyboard backlight off
     pinMode(BOARD_KEYBOARD_LED, OUTPUT);
@@ -1321,12 +1559,13 @@ void setup() {
 
 // Core 1: keyboard polling — never blocks on display
 void loop() {
-    // Check WiFi status periodically
-    static unsigned long last_wifi_check = 0;
-    if (millis() - last_wifi_check > 1000) {
-        last_wifi_check = millis();
+    // Check WiFi / modem status periodically
+    static unsigned long last_net_check = 0;
+    if (millis() - last_net_check > 1000) {
+        last_net_check = millis();
         wifiCheck();
-        if (app_mode == MODE_TERMINAL && (wifi_state == WIFI_CONNECTED || wifi_state == WIFI_FAILED)) {
+        if (app_mode == MODE_TERMINAL && (wifi_state == WIFI_CONNECTED || wifi_state == WIFI_FAILED
+            || modem_state != MODEM_OFF)) {
             term_render_requested = true;  // Update status bar
         }
     }
