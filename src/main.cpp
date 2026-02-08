@@ -3,7 +3,6 @@
 #include <Wire.h>
 #include <GxEPD2_BW.h>
 #include <Adafruit_TCA8418.h>
-#include <Fonts/FreeMono9pt7b.h>
 #include <WiFi.h>
 #include <libssh/libssh.h>
 #include <esp_task_wdt.h>
@@ -93,13 +92,13 @@ static volatile AppMode app_mode = MODE_NOTEPAD;
 // --- Editor State (shared between cores, protected by mutex) ---
 
 #define MAX_TEXT_LEN    4096
-#define CHAR_W          11
-#define CHAR_H          15
-#define MARGIN_X        4
-#define MARGIN_Y        4
+#define CHAR_W          6
+#define CHAR_H          8
+#define MARGIN_X        2
+#define MARGIN_Y        2
 #define SCREEN_W        240
 #define SCREEN_H        320
-#define STATUS_H        14
+#define STATUS_H        10
 #define COLS_PER_LINE   ((SCREEN_W - MARGIN_X * 2) / CHAR_W)
 #define ROWS_PER_SCREEN ((SCREEN_H - MARGIN_Y - STATUS_H) / CHAR_H)
 
@@ -146,6 +145,10 @@ static int  term_snap_ccol   = 0;
 // ANSI escape parser state
 static bool in_escape  = false;
 static bool in_bracket = false;
+#define MAX_CSI_PARAMS 8
+static int  csi_params[MAX_CSI_PARAMS];
+static int  csi_param_count = 0;
+static bool csi_parsing_num = false;
 
 // --- SSH State ---
 
@@ -204,6 +207,8 @@ void terminalClear() {
     term_cursor_col = 0;
     in_escape  = false;
     in_bracket = false;
+    csi_param_count = 0;
+    csi_parsing_num = false;
 }
 
 void terminalScrollUp() {
@@ -217,6 +222,129 @@ void terminalScrollUp() {
     if (term_line_count > 1) term_line_count--;
 }
 
+void handleCSI(char final_char) {
+    int p0 = (csi_param_count > 0) ? csi_params[0] : 0;
+    int p1 = (csi_param_count > 1) ? csi_params[1] : 0;
+
+    switch (final_char) {
+        case 'A': // Cursor Up
+            term_cursor_row -= (p0 > 0) ? p0 : 1;
+            if (term_cursor_row < 0) term_cursor_row = 0;
+            break;
+        case 'B': // Cursor Down
+            term_cursor_row += (p0 > 0) ? p0 : 1;
+            if (term_cursor_row >= TERM_ROWS) term_cursor_row = TERM_ROWS - 1;
+            break;
+        case 'C': // Cursor Right
+            term_cursor_col += (p0 > 0) ? p0 : 1;
+            if (term_cursor_col >= TERM_COLS) term_cursor_col = TERM_COLS - 1;
+            break;
+        case 'D': // Cursor Left
+            term_cursor_col -= (p0 > 0) ? p0 : 1;
+            if (term_cursor_col < 0) term_cursor_col = 0;
+            break;
+        case 'H': // Cursor Position (row;col) — 1-based
+        case 'f': // Same as H
+            term_cursor_row = (p0 > 0) ? p0 - 1 : 0;
+            term_cursor_col = (p1 > 0) ? p1 - 1 : 0;
+            if (term_cursor_row >= TERM_ROWS) term_cursor_row = TERM_ROWS - 1;
+            if (term_cursor_col >= TERM_COLS) term_cursor_col = TERM_COLS - 1;
+            if (term_cursor_row >= term_line_count) term_line_count = term_cursor_row + 1;
+            break;
+        case 'J': // Erase in Display
+            if (p0 == 0) {
+                // Clear from cursor to end of screen
+                memset(&term_buf[term_cursor_row][term_cursor_col], ' ',
+                       TERM_COLS - term_cursor_col);
+                for (int r = term_cursor_row + 1; r < TERM_ROWS; r++) {
+                    memset(term_buf[r], ' ', TERM_COLS);
+                }
+            } else if (p0 == 1) {
+                // Clear from start to cursor
+                for (int r = 0; r < term_cursor_row; r++) {
+                    memset(term_buf[r], ' ', TERM_COLS);
+                }
+                memset(term_buf[term_cursor_row], ' ', term_cursor_col + 1);
+            } else if (p0 == 2 || p0 == 3) {
+                // Clear entire screen
+                for (int r = 0; r < TERM_ROWS; r++) {
+                    memset(term_buf[r], ' ', TERM_COLS);
+                }
+                term_cursor_row = 0;
+                term_cursor_col = 0;
+                term_line_count = 1;
+                term_scroll = 0;
+            }
+            break;
+        case 'K': // Erase in Line
+            if (p0 == 0) {
+                // Clear from cursor to end of line
+                memset(&term_buf[term_cursor_row][term_cursor_col], ' ',
+                       TERM_COLS - term_cursor_col);
+            } else if (p0 == 1) {
+                // Clear from start of line to cursor
+                memset(term_buf[term_cursor_row], ' ', term_cursor_col + 1);
+            } else if (p0 == 2) {
+                // Clear entire line
+                memset(term_buf[term_cursor_row], ' ', TERM_COLS);
+            }
+            break;
+        case 'G': // Cursor Horizontal Absolute
+            term_cursor_col = (p0 > 0) ? p0 - 1 : 0;
+            if (term_cursor_col >= TERM_COLS) term_cursor_col = TERM_COLS - 1;
+            break;
+        case 'd': // Cursor Vertical Absolute
+            term_cursor_row = (p0 > 0) ? p0 - 1 : 0;
+            if (term_cursor_row >= TERM_ROWS) term_cursor_row = TERM_ROWS - 1;
+            if (term_cursor_row >= term_line_count) term_line_count = term_cursor_row + 1;
+            break;
+        case 'P': { // Delete Characters
+            int n = (p0 > 0) ? p0 : 1;
+            int r = term_cursor_row;
+            int c = term_cursor_col;
+            if (c + n > TERM_COLS) n = TERM_COLS - c;
+            memmove(&term_buf[r][c], &term_buf[r][c + n], TERM_COLS - c - n);
+            memset(&term_buf[r][TERM_COLS - n], ' ', n);
+            break;
+        }
+        case '@': { // Insert Characters
+            int n = (p0 > 0) ? p0 : 1;
+            int r = term_cursor_row;
+            int c = term_cursor_col;
+            if (c + n > TERM_COLS) n = TERM_COLS - c;
+            memmove(&term_buf[r][c + n], &term_buf[r][c], TERM_COLS - c - n);
+            memset(&term_buf[r][c], ' ', n);
+            break;
+        }
+        case 'L': { // Insert Lines
+            int n = (p0 > 0) ? p0 : 1;
+            for (int j = TERM_ROWS - 1; j >= term_cursor_row + n; j--) {
+                memcpy(term_buf[j], term_buf[j - n], TERM_COLS + 1);
+            }
+            for (int j = term_cursor_row; j < term_cursor_row + n && j < TERM_ROWS; j++) {
+                memset(term_buf[j], ' ', TERM_COLS);
+                term_buf[j][TERM_COLS] = '\0';
+            }
+            break;
+        }
+        case 'M': { // Delete Lines
+            int n = (p0 > 0) ? p0 : 1;
+            for (int j = term_cursor_row; j + n < TERM_ROWS; j++) {
+                memcpy(term_buf[j], term_buf[j + n], TERM_COLS + 1);
+            }
+            for (int j = TERM_ROWS - n; j < TERM_ROWS; j++) {
+                memset(term_buf[j], ' ', TERM_COLS);
+                term_buf[j][TERM_COLS] = '\0';
+            }
+            break;
+        }
+        // m (SGR - colors/attributes), h/l (mode set/reset), r (scroll region)
+        // — ignored silently (no color on e-ink, modes not critical)
+        default:
+            break;
+    }
+}
+
 void terminalAppendOutput(const char* data, int len) {
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)data[i];
@@ -224,13 +352,68 @@ void terminalAppendOutput(const char* data, int len) {
         // ANSI escape sequence handling
         if (in_escape) {
             if (!in_bracket) {
-                if (c == '[') { in_bracket = true; continue; }
-                // Single char after ESC (e.g. ESC M) — just skip
+                if (c == '[') {
+                    in_bracket = true;
+                    csi_param_count = 0;
+                    csi_parsing_num = false;
+                    memset(csi_params, 0, sizeof(csi_params));
+                    continue;
+                }
+                if (c == ']') {
+                    // OSC sequence — skip until ST (ESC \ or BEL)
+                    in_escape = false;
+                    in_bracket = false;
+                    // Scan ahead for BEL or ESC backslash
+                    while (i + 1 < len) {
+                        i++;
+                        if ((unsigned char)data[i] == 0x07) break; // BEL
+                        if ((unsigned char)data[i] == 0x1B && i + 1 < len && data[i+1] == '\\') {
+                            i++;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // Single char after ESC (e.g. ESC M for reverse index)
                 in_escape = false;
                 continue;
             }
-            // Inside ESC[ ... — wait for final letter
+            // Inside ESC[ ... collecting parameters
+            if (c >= '0' && c <= '9') {
+                if (!csi_parsing_num) {
+                    if (csi_param_count < MAX_CSI_PARAMS) {
+                        csi_params[csi_param_count] = 0;
+                        csi_parsing_num = true;
+                    }
+                }
+                if (csi_param_count < MAX_CSI_PARAMS) {
+                    csi_params[csi_param_count] = csi_params[csi_param_count] * 10 + (c - '0');
+                }
+                continue;
+            }
+            if (c == ';') {
+                if (csi_parsing_num) {
+                    csi_param_count++;
+                    csi_parsing_num = false;
+                } else {
+                    // Empty param (default 0)
+                    if (csi_param_count < MAX_CSI_PARAMS) {
+                        csi_params[csi_param_count] = 0;
+                    }
+                    csi_param_count++;
+                }
+                continue;
+            }
+            if (c == '?' || c == '>' || c == '!') {
+                // Private mode prefix — continue collecting
+                continue;
+            }
+            // Final character — execute CSI sequence
             if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '@' || c == '`') {
+                if (csi_parsing_num && csi_param_count < MAX_CSI_PARAMS) {
+                    csi_param_count++;
+                }
+                handleCSI((char)c);
                 in_escape  = false;
                 in_bracket = false;
             }
@@ -548,7 +731,7 @@ void drawLinesRange(int first_line, int last_line) {
             display.fillRect(x, y, CHAR_W, CHAR_H, GxEPD_BLACK);
             if (i < snap_len && snap_buf[i] != '\n') {
                 display.setTextColor(GxEPD_WHITE);
-                display.setCursor(x, y + CHAR_H - 3);
+                display.setCursor(x, y + 1);
                 display.print(snap_buf[i]);
                 display.setTextColor(GxEPD_BLACK);
             }
@@ -560,7 +743,7 @@ void drawLinesRange(int first_line, int last_line) {
 
         if (sl >= first_line && sl <= last_line && i != snap_cursor) {
             int x = MARGIN_X + col * CHAR_W;
-            int y = MARGIN_Y + sl * CHAR_H + CHAR_H - 3;
+            int y = MARGIN_Y + sl * CHAR_H + 1;
             display.setCursor(x, y);
             display.print(c);
         }
@@ -577,9 +760,9 @@ void drawStatusBar() {
     int bar_y = SCREEN_H - STATUS_H;
     display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
     display.setTextColor(GxEPD_WHITE);
-    display.setFont(&FreeMono9pt7b);
-    display.setCursor(2, SCREEN_H - 3);
-    char status[50];
+    display.setFont(NULL);
+    display.setCursor(2, bar_y + 1);
+    char status[60];
     snprintf(status, sizeof(status), "L%d C%d %dch %s%s%s",
              info.cursor_line + 1, info.cursor_col + 1, snap_len,
              snap_shift ? "[SH]" : "",
@@ -615,12 +798,12 @@ void drawTerminalLines(int first_line, int last_line) {
                 display.fillRect(x, y, CHAR_W, CHAR_H, GxEPD_BLACK);
                 if (ch != ' ') {
                     display.setTextColor(GxEPD_WHITE);
-                    display.setCursor(x, y + CHAR_H - 3);
+                    display.setCursor(x, y + 1);
                     display.print(ch);
                     display.setTextColor(GxEPD_BLACK);
                 }
             } else if (ch != ' ') {
-                display.setCursor(x, y + CHAR_H - 3);
+                display.setCursor(x, y + 1);
                 display.print(ch);
             }
         }
@@ -631,11 +814,13 @@ void drawTerminalStatusBar() {
     int bar_y = SCREEN_H - STATUS_H;
     display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
     display.setTextColor(GxEPD_WHITE);
-    display.setFont(&FreeMono9pt7b);
-    display.setCursor(2, SCREEN_H - 3);
+    display.setFont(NULL);
+    display.setCursor(2, bar_y + 1);
 
-    char status[50];
-    if (ssh_connected) {
+    char status[60];
+    if (ssh_connecting) {
+        snprintf(status, sizeof(status), "[TERM] SSH connecting...");
+    } else if (ssh_connected) {
         snprintf(status, sizeof(status), "[TERM] %s@%s", SSH_USER, SSH_HOST);
     } else if (wifi_state == WIFI_CONNECTED) {
         snprintf(status, sizeof(status), "[TERM] %s", WiFi.localIP().toString().c_str());
@@ -657,7 +842,7 @@ void renderTerminal() {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        display.setFont(&FreeMono9pt7b);
+        display.setFont(NULL);
         drawTerminalLines(0, ROWS_PER_SCREEN - 1);
         drawTerminalStatusBar();
     } while (display.nextPage());
@@ -670,7 +855,7 @@ void renderTerminalFullClean() {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        display.setFont(&FreeMono9pt7b);
+        display.setFont(NULL);
         drawTerminalLines(0, ROWS_PER_SCREEN - 1);
         drawTerminalStatusBar();
     } while (display.nextPage());
@@ -692,7 +877,7 @@ void refreshLines(int first_line, int last_line) {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        display.setFont(&FreeMono9pt7b);
+        display.setFont(NULL);
         drawLinesRange(first_line, ROWS_PER_SCREEN - 1);
         drawStatusBar();
     } while (display.nextPage());
@@ -706,7 +891,7 @@ void refreshAllPartial() {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        display.setFont(&FreeMono9pt7b);
+        display.setFont(NULL);
         drawLinesRange(0, ROWS_PER_SCREEN - 1);
         drawStatusBar();
     } while (display.nextPage());
@@ -719,7 +904,7 @@ void refreshFullClean() {
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
-        display.setFont(&FreeMono9pt7b);
+        display.setFont(NULL);
         drawLinesRange(0, ROWS_PER_SCREEN - 1);
         drawStatusBar();
     } while (display.nextPage());
@@ -778,9 +963,9 @@ void displayTask(void* param) {
         // --- Terminal mode ---
         if (cur_mode == MODE_TERMINAL) {
             if (term_render_requested) {
-                // Debounce: wait 100ms to batch fast output
+                // Debounce: wait 200ms to batch fast output (reduces e-ink ghosting)
                 unsigned long now = millis();
-                if (now - term_last_render < 100) {
+                if (now - term_last_render < 200) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                     continue;
                 }
@@ -791,7 +976,7 @@ void displayTask(void* param) {
                 snapshotTerminalState();
                 xSemaphoreGive(state_mutex);
 
-                if (partial_count >= 30) {
+                if (partial_count >= 20) {
                     renderTerminalFullClean();
                 } else {
                     renderTerminal();
@@ -824,7 +1009,7 @@ void displayTask(void* param) {
         scroll_line = snap_scroll;
         xSemaphoreGive(state_mutex);
 
-        if (partial_count >= 30) {
+        if (partial_count >= 20) {
             refreshFullClean();
             prev_layout = cur;
             continue;
@@ -937,6 +1122,8 @@ bool handleNotepadKeyPress(int event_code) {
                 text_buf[text_len] = '\0';
             } else return false;
         }
+        // Alt+F: Force full e-ink refresh
+        else if (base == 'f') { alt_mode = false; partial_count = 100; render_requested = true; return false; }
         else return false;
         return true;
     }
@@ -1004,11 +1191,35 @@ bool handleTerminalKeyPress(int event_code) {
         // Backspace in nav mode
         if (base == '\b') { sshSendKey(0x7F); return false; }
         // Alt+S: SSH connect
-        if (base == 's') { sshConnectAsync(); return true; }
-        // Alt+Q: SSH disconnect
-        if (base == 'q') { sshDisconnect(); return true; }
+        if (base == 's') { alt_mode = false; sshConnectAsync(); return true; }
+        // Alt+Q: SSH disconnect (but not Ctrl+Q — reserved for nav)
+        if (base == 'q') { alt_mode = false; sshDisconnect(); return true; }
         // Alt+W: WiFi reconnect
-        if (base == 'w') { wifi_state = WIFI_IDLE; wifiConnect(); return true; }
+        if (base == 'w') { alt_mode = false; wifi_state = WIFI_IDLE; wifiConnect(); return true; }
+        // Alt+F: Force full e-ink refresh
+        if (base == 'f') { alt_mode = false; partial_count = 100; term_render_requested = true; return false; }
+        // Alt+P: Paste notepad buffer into SSH
+        if (base == 'p') {
+            alt_mode = false;
+            if (ssh_connected && ssh_chan && text_len > 0) {
+                // Send notepad text_buf over SSH in small chunks
+                for (int i = 0; i < text_len; i += 64) {
+                    int chunk = (text_len - i > 64) ? 64 : (text_len - i);
+                    ssh_channel_write(ssh_chan, &text_buf[i], chunk);
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                }
+            }
+            return true;
+        }
+        // Alt+Space: send Escape
+        if (base == ' ') { sshSendKey(0x1B); return false; }
+        // Alt+Enter: send Tab
+        if (base == '\n') { sshSendKey('\t'); return false; }
+        // All other Alt+letter: send Ctrl+letter (a=0x01 .. z=0x1A)
+        if (base >= 'a' && base <= 'z') {
+            sshSendKey(base - 'a' + 1);
+            return false;
+        }
         return false;
     }
 
