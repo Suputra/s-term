@@ -4,6 +4,7 @@
 #include <GxEPD2_BW.h>
 #include <Adafruit_TCA8418.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <libssh/libssh.h>
 #include <esp_task_wdt.h>
 #include <esp_netif.h>
@@ -14,15 +15,14 @@
 
 // --- WiFi / SSH Config (loaded from SD /CONFIG) ---
 
-static char config_wifi_ssid[64]  = "";
-static char config_wifi_pass[64]  = "";
+static WiFiMulti wifiMulti;
+static int config_wifi_count = 0;
 static char config_ssh_host[64]   = "";
 static int  config_ssh_port       = 22;
 static char config_ssh_user[64]   = "";
 static char config_ssh_pass[64]   = "";
 
 // --- VPN Config (loaded from SD /CONFIG) ---
-static bool   config_vpn_enabled = false;
 static char   config_vpn_privkey[64] = "";
 static char   config_vpn_pubkey[64]  = "";
 static char   config_vpn_psk[64]     = "";
@@ -31,6 +31,7 @@ static char   config_vpn_endpoint[64] = "";
 static int    config_vpn_port        = 51820;
 static WireGuard wg;
 static bool   vpn_connected = false;
+static bool vpnConfigured() { return config_vpn_privkey[0] != '\0'; }
 
 // --- SD Card State ---
 static bool sd_mounted = false;
@@ -580,34 +581,58 @@ void sdLoadConfig() {
     File f = SD.open("/CONFIG", FILE_READ);
     if (!f) { Serial.println("SD: no /CONFIG"); return; }
 
-    // CONFIG format: one value per line, # comments, blank lines skipped
-    // Line order: wifi_ssid, wifi_pass, ssh_host, ssh_port, ssh_user, ssh_pass
-    //             vpn_enabled (ENABLE), vpn_privkey, vpn_pubkey, vpn_psk, vpn_ip, vpn_endpoint, vpn_port
-    char* fields[] = {
-        config_wifi_ssid, config_wifi_pass, config_ssh_host, NULL, config_ssh_user, config_ssh_pass,
-        NULL, config_vpn_privkey, config_vpn_pubkey, config_vpn_psk, config_vpn_ip, config_vpn_endpoint, NULL
-    };
-    int sizes[] = { 64, 64, 64, 0, 64, 64, 0, 64, 64, 64, 32, 64, 0 };
-    int field = 0;
+    // CONFIG format: section-based, # comments, blank lines skipped
+    // # wifi — pairs of ssid/password (variable count)
+    // # ssh — host, port, user, pass
+    // # vpn — ENABLE, privkey, pubkey, psk, ip, endpoint, port
+    enum { SEC_WIFI, SEC_SSH, SEC_VPN } section = SEC_WIFI;
+    int field = 0;  // field index within current section
+    char wifi_ssid[64] = "";
 
-    while (f.available() && field < 13) {
+    while (f.available()) {
         String line = f.readStringUntil('\n');
         line.trim();
-        if (line.length() == 0 || line[0] == '#') continue;
-        if (field == 3) {
-            config_ssh_port = line.toInt();
-        } else if (field == 6) {
-            config_vpn_enabled = line.equalsIgnoreCase("ENABLE");
-        } else if (field == 12) {
-            config_vpn_port = line.toInt();
-        } else {
-            strncpy(fields[field], line.c_str(), sizes[field] - 1);
+        if (line.length() == 0) continue;
+        if (line[0] == '#') {
+            // Section headers
+            if (line.indexOf("ssh") >= 0)      { section = SEC_SSH; field = 0; }
+            else if (line.indexOf("vpn") >= 0) { section = SEC_VPN; field = 0; }
+            continue;
         }
-        field++;
+
+        if (section == SEC_WIFI) {
+            if (field % 2 == 0) {
+                strncpy(wifi_ssid, line.c_str(), 63);
+                wifi_ssid[63] = '\0';
+            } else {
+                wifiMulti.addAP(wifi_ssid, line.c_str());
+                config_wifi_count++;
+                Serial.printf("SD: WiFi AP added: %s\n", wifi_ssid);
+            }
+            field++;
+        } else if (section == SEC_SSH) {
+            switch (field) {
+                case 0: strncpy(config_ssh_host, line.c_str(), 63); break;
+                case 1: config_ssh_port = line.toInt(); break;
+                case 2: strncpy(config_ssh_user, line.c_str(), 63); break;
+                case 3: strncpy(config_ssh_pass, line.c_str(), 63); break;
+            }
+            field++;
+        } else if (section == SEC_VPN) {
+            switch (field) {
+                case 0: strncpy(config_vpn_privkey, line.c_str(), 63); break;
+                case 1: strncpy(config_vpn_pubkey, line.c_str(), 63); break;
+                case 2: strncpy(config_vpn_psk, line.c_str(), 63); break;
+                case 3: strncpy(config_vpn_ip, line.c_str(), 31); break;
+                case 4: strncpy(config_vpn_endpoint, line.c_str(), 63); break;
+                case 5: config_vpn_port = line.toInt(); break;
+            }
+            field++;
+        }
     }
     f.close();
-    Serial.printf("SD: config loaded (SSID=%s, host=%s, VPN=%s)\n",
-                  config_wifi_ssid, config_ssh_host, config_vpn_enabled ? "on" : "off");
+    Serial.printf("SD: config loaded (%d WiFi APs, host=%s, VPN=%s)\n",
+                  config_wifi_count, config_ssh_host, vpnConfigured() ? "yes" : "no");
 }
 
 // --- File I/O Helpers ---
@@ -713,17 +738,17 @@ void autoSaveDirty() {
 
 void wifiConnect() {
     if (wifi_state == WIFI_CONNECTING || wifi_state == WIFI_CONNECTED) return;
+    if (config_wifi_count == 0) { wifi_state = WIFI_FAILED; return; }
     wifi_state = WIFI_CONNECTING;
     WiFi.mode(WIFI_STA);
-    WiFi.begin(config_wifi_ssid, config_wifi_pass);
-    Serial.println("WiFi: connecting...");
+    Serial.println("WiFi: scanning for known networks...");
 }
 
 void wifiCheck() {
     if (wifi_state == WIFI_CONNECTING) {
-        if (WiFi.status() == WL_CONNECTED) {
+        if (wifiMulti.run() == WL_CONNECTED) {
             wifi_state = WIFI_CONNECTED;
-            Serial.printf("WiFi: connected, IP=%s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("WiFi: connected to %s, IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
         }
     } else if (wifi_state == WIFI_CONNECTED) {
         if (WiFi.status() != WL_CONNECTED) {
@@ -952,7 +977,7 @@ bool hasNetwork() {
 }
 
 bool vpnConnect() {
-    if (vpn_connected || !config_vpn_enabled) return true;
+    if (vpn_connected) return true;
     Serial.println("VPN: syncing time via NTP...");
     configTime(0, 0, "pool.ntp.org", "time.google.com");
     struct tm tm;
@@ -973,6 +998,36 @@ bool vpnConnect() {
     return true;
 }
 
+bool sshTryConnect() {
+    Serial.printf("SSH: connecting to %s:%d...\n", config_ssh_host, config_ssh_port);
+
+    ssh_sess = ssh_new();
+    if (!ssh_sess) return false;
+
+    ssh_options_set(ssh_sess, SSH_OPTIONS_HOST, config_ssh_host);
+    int port = config_ssh_port;
+    ssh_options_set(ssh_sess, SSH_OPTIONS_PORT, &port);
+    ssh_options_set(ssh_sess, SSH_OPTIONS_USER, config_ssh_user);
+    long timeout = 5;  // 5 second connect timeout
+    ssh_options_set(ssh_sess, SSH_OPTIONS_TIMEOUT, &timeout);
+
+    if (ssh_connect(ssh_sess) != SSH_OK) {
+        Serial.printf("SSH: connect failed: %s\n", ssh_get_error(ssh_sess));
+        ssh_free(ssh_sess);
+        ssh_sess = NULL;
+        return false;
+    }
+
+    if (ssh_userauth_password(ssh_sess, NULL, config_ssh_pass) != SSH_AUTH_SUCCESS) {
+        Serial.printf("SSH: auth failed: %s\n", ssh_get_error(ssh_sess));
+        ssh_disconnect(ssh_sess);
+        ssh_free(ssh_sess);
+        ssh_sess = NULL;
+        return false;
+    }
+    return true;
+}
+
 bool sshConnect() {
     if (!hasNetwork()) {
         Serial.println("SSH: no network (WiFi or 4G)");
@@ -983,44 +1038,24 @@ bool sshConnect() {
         return false;
     }
 
-    // Connect VPN if enabled
-    if (config_vpn_enabled && !vpn_connected) {
-        if (!vpnConnect()) {
-            Serial.println("SSH: VPN connect failed, aborting");
-            return false;
-        }
-    }
-
     // Clean up any previous session
     sshDisconnect();
 
-    Serial.printf("SSH: connecting to %s:%d...\n", config_ssh_host, config_ssh_port);
-
-    ssh_sess = ssh_new();
-    if (!ssh_sess) {
-        Serial.println("SSH: ssh_new failed");
-        return false;
-    }
-
-    ssh_options_set(ssh_sess, SSH_OPTIONS_HOST, config_ssh_host);
-    int port = config_ssh_port;
-    ssh_options_set(ssh_sess, SSH_OPTIONS_PORT, &port);
-    ssh_options_set(ssh_sess, SSH_OPTIONS_USER, config_ssh_user);
-
-    if (ssh_connect(ssh_sess) != SSH_OK) {
-        Serial.printf("SSH: connect failed: %s\n", ssh_get_error(ssh_sess));
-        ssh_free(ssh_sess);
-        ssh_sess = NULL;
-
-        return false;
-    }
-
-    if (ssh_userauth_password(ssh_sess, NULL, config_ssh_pass) != SSH_AUTH_SUCCESS) {
-        Serial.printf("SSH: auth failed: %s\n", ssh_get_error(ssh_sess));
-        ssh_disconnect(ssh_sess);
-        ssh_free(ssh_sess);
-        ssh_sess = NULL;
-
+    // Try direct SSH first
+    if (sshTryConnect()) {
+        Serial.println("SSH: direct connect succeeded");
+    } else if (vpnConfigured() && !vpn_connected) {
+        // Direct failed, try VPN
+        Serial.println("SSH: direct failed, trying VPN...");
+        if (!vpnConnect()) {
+            Serial.println("SSH: VPN connect failed");
+            return false;
+        }
+        if (!sshTryConnect()) {
+            Serial.println("SSH: connect via VPN also failed");
+            return false;
+        }
+    } else {
         return false;
     }
 

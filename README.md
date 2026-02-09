@@ -14,21 +14,25 @@ pio device monitor   # serial output
 
 ## SD Card Config
 
-Credentials are loaded from a `/CONFIG` file on the SD card (FAT32). One value per line, `#` comments, blank lines ignored.
+Credentials are loaded from a `/CONFIG` file on the SD card (FAT32). Section-based format with `#` comments and blank lines ignored. Section headers are `# wifi`, `# ssh`, `# vpn`.
 
 ```
-# wifi
-my_ssid
-my_password
+# wifi (multiple SSID/password pairs, connects to strongest)
+home_ssid
+home_password
+phone_hotspot
+hotspot_password
+
 # ssh
 10.0.0.100
 22
 user
 password
-# vpn (omit or set DISABLE to skip)
-ENABLE
+
+# vpn (omit section if not using VPN)
 <device_private_key_base64>
 <server_public_key_base64>
+<preshared_key_base64>
 <device_vpn_ip>
 <endpoint_host_or_ip>
 51820
@@ -47,7 +51,7 @@ Type on the keyboard. Text wraps to the e-ink display.
 
 ### Terminal
 
-Double-tap **MIC** to switch to terminal mode. The device connects WiFi, then VPN (if enabled), then SSH — all automatically. Double-tap **MIC** again to return to notepad.
+Double-tap **MIC** to switch to terminal mode. The device connects WiFi, tries SSH directly, and if the host isn't reachable falls back through WireGuard VPN automatically. Double-tap **MIC** again to return to notepad.
 
 - **Alt+Q** — disconnect SSH
 - **Alt+W** — reconnect WiFi
