@@ -1280,7 +1280,7 @@ void sshReceiveTask(void* param) {
             term_render_requested = true;
             vTaskDelay(pdMS_TO_TICKS(1000));
         } else {
-            vTaskDelay(pdMS_TO_TICKS(50));
+            vTaskDelay(pdMS_TO_TICKS(5));
         }
     }
 }
@@ -1289,11 +1289,41 @@ void sshReceiveTask(void* param) {
 
 void drawLinesRange(int first_line, int last_line) {
     int text_line = 0, col = 0;
+    int start_i = 0;
 
-    for (int i = 0; i <= snap_len; i++) {
+    // Fast-forward to snap_scroll line to avoid scanning entire buffer
+    int target_line = snap_scroll + first_line;
+    if (target_line > 0) {
+        for (int i = 0; i < snap_len; i++) {
+            if (text_line >= target_line) { start_i = i; break; }
+            if (snap_buf[i] == '\n') { text_line++; col = 0; }
+            else { col++; if (col >= COLS_PER_LINE) { text_line++; col = 0; } }
+        }
+        if (text_line < target_line) return; // not enough lines
+    }
+
+    // Batch buffer for accumulating runs of chars on the same line
+    char run_buf[COLS_PER_LINE + 1];
+    int run_start_col = -1;
+    int run_len = 0;
+    int run_sl = -1;
+
+    // Flush accumulated run to display
+    auto flushRun = [&]() {
+        if (run_len > 0) {
+            run_buf[run_len] = '\0';
+            display.setCursor(MARGIN_X + run_start_col * CHAR_W, MARGIN_Y + run_sl * CHAR_H + 1);
+            display.print(run_buf);
+            run_len = 0;
+            run_start_col = -1;
+        }
+    };
+
+    for (int i = start_i; i <= snap_len; i++) {
         int sl = text_line - snap_scroll;
 
         if (i == snap_cursor && sl >= first_line && sl <= last_line) {
+            flushRun();
             int x = MARGIN_X + col * CHAR_W;
             int y = MARGIN_Y + sl * CHAR_H;
             display.fillRect(x, y, CHAR_W, CHAR_H, GxEPD_BLACK);
@@ -1307,20 +1337,31 @@ void drawLinesRange(int first_line, int last_line) {
 
         if (i >= snap_len) break;
         char c = snap_buf[i];
-        if (c == '\n') { text_line++; col = 0; continue; }
+        if (c == '\n') {
+            flushRun();
+            text_line++; col = 0; continue;
+        }
 
         if (sl >= first_line && sl <= last_line && i != snap_cursor) {
-            int x = MARGIN_X + col * CHAR_W;
-            int y = MARGIN_Y + sl * CHAR_H + 1;
-            display.setCursor(x, y);
-            display.print(c);
+            if (run_sl != sl || run_start_col + run_len != col) {
+                flushRun();
+                run_start_col = col;
+                run_sl = sl;
+            }
+            run_buf[run_len++] = c;
+        } else {
+            flushRun();
         }
 
         col++;
-        if (col >= COLS_PER_LINE) { text_line++; col = 0; }
+        if (col >= COLS_PER_LINE) {
+            flushRun();
+            text_line++; col = 0;
+        }
 
         if (text_line - snap_scroll > last_line && i != snap_cursor) break;
     }
+    flushRun();
 }
 
 // Battery reading via BQ27220 fuel gauge on I2C (address 0x55)
@@ -1354,8 +1395,7 @@ void updateBattery() {
 static unsigned long mic_last_press = 0;
 #define MIC_DOUBLE_TAP_MS 350
 
-void drawStatusBar() {
-    LayoutInfo info = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
+void drawStatusBar(const LayoutInfo& info) {
     int bar_y = SCREEN_H - STATUS_H;
     display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
     display.setTextColor(GxEPD_WHITE);
@@ -1391,38 +1431,62 @@ void drawStatusBar() {
 // --- Terminal Rendering ---
 
 void snapshotTerminalState() {
-    for (int i = 0; i < TERM_ROWS; i++) {
-        memcpy(term_snap_buf[i], term_buf[i], TERM_COLS + 1);
-    }
-    term_snap_lines  = term_line_count;
     term_snap_scroll = term_scroll;
     term_snap_crow   = term_cursor_row;
     term_snap_ccol   = term_cursor_col;
+    term_snap_lines  = term_line_count;
+    // Only copy visible rows + 1 for safety
+    int first = term_snap_scroll;
+    int last = first + ROWS_PER_SCREEN;
+    if (first < 0) first = 0;
+    if (last > TERM_ROWS) last = TERM_ROWS;
+    for (int i = first; i < last; i++) {
+        memcpy(term_snap_buf[i], term_buf[i], TERM_COLS + 1);
+    }
 }
 
 void drawTerminalLines(int first_line, int last_line) {
+    char run_buf[TERM_COLS + 1];
     for (int sl = first_line; sl <= last_line && sl < ROWS_PER_SCREEN; sl++) {
         int buf_row = term_snap_scroll + sl;
         if (buf_row < 0 || buf_row >= TERM_ROWS) continue;
+        bool is_cursor_row = (buf_row == term_snap_crow);
+        int y = MARGIN_Y + sl * CHAR_H;
 
-        for (int c = 0; c < TERM_COLS; c++) {
-            char ch = term_snap_buf[buf_row][c];
-            int x = MARGIN_X + c * CHAR_W;
-            int y = MARGIN_Y + sl * CHAR_H;
+        // Find runs of non-space characters and print them in batches
+        int c = 0;
+        while (c < TERM_COLS) {
+            // Skip spaces (unless cursor is here)
+            if (term_snap_buf[buf_row][c] == ' ' && !(is_cursor_row && c == term_snap_ccol)) {
+                c++;
+                continue;
+            }
 
-            // Draw cursor
-            if (buf_row == term_snap_crow && c == term_snap_ccol) {
+            // Draw cursor cell specially
+            if (is_cursor_row && c == term_snap_ccol) {
+                int x = MARGIN_X + c * CHAR_W;
                 display.fillRect(x, y, CHAR_W, CHAR_H, GxEPD_BLACK);
-                if (ch != ' ') {
+                if (term_snap_buf[buf_row][c] != ' ') {
                     display.setTextColor(GxEPD_WHITE);
                     display.setCursor(x, y + 1);
-                    display.print(ch);
+                    display.print(term_snap_buf[buf_row][c]);
                     display.setTextColor(GxEPD_BLACK);
                 }
-            } else if (ch != ' ') {
-                display.setCursor(x, y + 1);
-                display.print(ch);
+                c++;
+                continue;
             }
+
+            // Collect run of non-space chars (stop before cursor)
+            int run_start = c;
+            int run_len = 0;
+            while (c < TERM_COLS && term_snap_buf[buf_row][c] != ' ' &&
+                   !(is_cursor_row && c == term_snap_ccol)) {
+                run_buf[run_len++] = term_snap_buf[buf_row][c];
+                c++;
+            }
+            run_buf[run_len] = '\0';
+            display.setCursor(MARGIN_X + run_start * CHAR_W, y + 1);
+            display.print(run_buf);
         }
     }
 }
@@ -1514,7 +1578,7 @@ void renderTerminalFullClean() {
 
 // --- Notepad Rendering ---
 
-void refreshLines(int first_line, int last_line) {
+void refreshLines(int first_line, int last_line, const LayoutInfo& layout) {
     if (first_line < 0) first_line = 0;
     if (last_line >= ROWS_PER_SCREEN) last_line = ROWS_PER_SCREEN - 1;
 
@@ -1530,11 +1594,11 @@ void refreshLines(int first_line, int last_line) {
         display.setTextColor(GxEPD_BLACK);
         display.setFont(NULL);
         drawLinesRange(first_line, ROWS_PER_SCREEN - 1);
-        drawStatusBar();
+        drawStatusBar(layout);
     } while (display.nextPage());
 }
 
-void refreshAllPartial() {
+void refreshAllPartial(const LayoutInfo& layout) {
     partial_count++;
 
     display.setPartialWindow(0, 0, SCREEN_W, SCREEN_H);
@@ -1544,11 +1608,11 @@ void refreshAllPartial() {
         display.setTextColor(GxEPD_BLACK);
         display.setFont(NULL);
         drawLinesRange(0, ROWS_PER_SCREEN - 1);
-        drawStatusBar();
+        drawStatusBar(layout);
     } while (display.nextPage());
 }
 
-void refreshFullClean() {
+void refreshFullClean(const LayoutInfo& layout) {
     partial_count = 0;
     display.setFullWindow();
     display.firstPage();
@@ -1557,7 +1621,7 @@ void refreshFullClean() {
         display.setTextColor(GxEPD_BLACK);
         display.setFont(NULL);
         drawLinesRange(0, ROWS_PER_SCREEN - 1);
-        drawStatusBar();
+        drawStatusBar(layout);
     } while (display.nextPage());
 }
 
@@ -1583,12 +1647,11 @@ void displayTask(void* param) {
     snapshotState();
     xSemaphoreGive(state_mutex);
     display_idle = false;
-    refreshFullClean();
-    display_idle = true;
     prev_layout = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
+    refreshFullClean(prev_layout);
+    display_idle = true;
 
     AppMode last_mode = MODE_NOTEPAD;
-    unsigned long term_last_render = 0;
 
     for (;;) {
         // Yield SPI bus to SD card operations
@@ -1617,8 +1680,8 @@ void displayTask(void* param) {
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 snapshotState();
                 xSemaphoreGive(state_mutex);
-                refreshFullClean();
                 prev_layout = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
+                refreshFullClean(prev_layout);
             }
             display_idle = true;
             render_requested = false;
@@ -1629,13 +1692,7 @@ void displayTask(void* param) {
         // --- Terminal mode ---
         if (cur_mode == MODE_TERMINAL) {
             if (term_render_requested) {
-                unsigned long now = millis();
-                if (now - term_last_render < 200) {
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                    continue;
-                }
                 term_render_requested = false;
-                term_last_render = now;
 
                 display_idle = false;
                 if (connect_status_count > 0) {
@@ -1678,7 +1735,6 @@ void displayTask(void* param) {
 
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         snapshotState();
-        xSemaphoreGive(state_mutex);
 
         LayoutInfo cur = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
 
@@ -1688,13 +1744,12 @@ void displayTask(void* param) {
         if (cur.cursor_line >= snap_scroll + ROWS_PER_SCREEN) {
             snap_scroll = cur.cursor_line - ROWS_PER_SCREEN + 1;
         }
-        xSemaphoreTake(state_mutex, portMAX_DELAY);
         scroll_line = snap_scroll;
         xSemaphoreGive(state_mutex);
 
         display_idle = false;
         if (partial_count >= 20) {
-            refreshFullClean();
+            refreshFullClean(cur);
             display_idle = true;
             prev_layout = cur;
             continue;
@@ -1702,7 +1757,7 @@ void displayTask(void* param) {
 
         int line_delta = abs(cur.cursor_line - prev_layout.cursor_line);
         if (line_delta > ROWS_PER_SCREEN) {
-            refreshAllPartial();
+            refreshAllPartial(cur);
             display_idle = true;
             prev_layout = cur;
             continue;
@@ -1714,12 +1769,12 @@ void displayTask(void* param) {
         if (cur.total_lines != prev_layout.total_lines) {
             int from = min(old_sl, new_sl);
             if (from < 0) from = 0;
-            refreshLines(from, ROWS_PER_SCREEN - 1);
+            refreshLines(from, ROWS_PER_SCREEN - 1, cur);
         } else {
             int min_l = min(old_sl, new_sl);
             int max_l = max(old_sl, new_sl);
             if (min_l < 0) min_l = 0;
-            refreshLines(min_l, max_l);
+            refreshLines(min_l, max_l, cur);
         }
         display_idle = true;
 
@@ -2603,16 +2658,21 @@ void setup() {
 
 // Core 1: keyboard polling — never blocks on display
 void loop() {
-    // Check WiFi / modem / battery status periodically
+    // Check WiFi / modem status (lightweight cached state check)
     static unsigned long last_net_check = 0;
-    if (millis() - last_net_check > 1000) {
+    if (millis() - last_net_check > 5000) {
         last_net_check = millis();
         wifiCheck();
-        updateBattery();
         // Auto-connect SSH if we switched to terminal and need it
         if (app_mode == MODE_TERMINAL && !ssh_connected && !ssh_connecting) {
             sshConnectAsync();
         }
+    }
+    // Battery check less often (I2C transaction)
+    static unsigned long last_batt_check = 0;
+    if (millis() - last_batt_check > 30000) {
+        last_batt_check = millis();
+        updateBattery();
     }
 
     // MIC single-tap timeout → open command processor
