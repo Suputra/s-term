@@ -210,6 +210,29 @@ static bool in_bracket = false;
 static int  csi_params[MAX_CSI_PARAMS];
 static int  csi_param_count = 0;
 static bool csi_parsing_num = false;
+static bool csi_private = false;      // '?' seen in CSI params
+
+// Scroll region (0-based screen rows)
+static int scroll_region_top = 0;
+static int scroll_region_bot = ROWS_PER_SCREEN - 1;
+static bool scroll_region_set = false;  // explicitly set by CSI r
+
+// Alternate screen buffer
+static char term_alt_buf[TERM_ROWS][TERM_COLS + 1];
+static bool term_alt_active = false;
+static int saved_main_cursor_row = 0, saved_main_cursor_col = 0;
+static int saved_main_line_count = 0, saved_main_scroll = 0;
+
+// Cursor save/restore (ESC 7/8, CSI s/u)
+static int saved_cursor_row = 0, saved_cursor_col = 0;
+
+// Cursor visibility
+static bool cursor_visible = true;
+static bool term_snap_cursor_visible = true;
+
+// UTF-8 parsing state
+static int utf8_remaining = 0;
+static uint32_t utf8_codepoint = 0;
 
 // --- SSH State ---
 
@@ -276,22 +299,155 @@ void terminalClear() {
     in_bracket = false;
     csi_param_count = 0;
     csi_parsing_num = false;
+    csi_private = false;
+    scroll_region_top = 0;
+    scroll_region_bot = ROWS_PER_SCREEN - 1;
+    scroll_region_set = false;
+    term_alt_active = false;
+    cursor_visible = true;
+    utf8_remaining = 0;
+    utf8_codepoint = 0;
+    saved_cursor_row = 0;
+    saved_cursor_col = 0;
 }
 
-void terminalScrollUp() {
-    // Shift all lines up by one, clear the last line
-    for (int i = 0; i < TERM_ROWS - 1; i++) {
+void terminalScrollRegionUp(int top, int bot) {
+    if (top < 0) top = 0;
+    if (bot >= TERM_ROWS) bot = TERM_ROWS - 1;
+    for (int i = top; i < bot; i++) {
         memcpy(term_buf[i], term_buf[i + 1], TERM_COLS + 1);
     }
-    memset(term_buf[TERM_ROWS - 1], ' ', TERM_COLS);
-    term_buf[TERM_ROWS - 1][TERM_COLS] = '\0';
-    if (term_cursor_row > 0) term_cursor_row--;
-    if (term_line_count > 1) term_line_count--;
+    memset(term_buf[bot], ' ', TERM_COLS);
+    term_buf[bot][TERM_COLS] = '\0';
+}
+
+void terminalScrollRegionDown(int top, int bot) {
+    if (top < 0) top = 0;
+    if (bot >= TERM_ROWS) bot = TERM_ROWS - 1;
+    for (int i = bot; i > top; i--) {
+        memcpy(term_buf[i], term_buf[i - 1], TERM_COLS + 1);
+    }
+    memset(term_buf[top], ' ', TERM_COLS);
+    term_buf[top][TERM_COLS] = '\0';
+}
+
+// Map Unicode codepoint to printable ASCII (box drawing, symbols)
+char unicodeToAscii(uint32_t cp) {
+    // Box drawing: U+2500-U+257F
+    if (cp >= 0x2500 && cp <= 0x257F) {
+        // Horizontal lines
+        if (cp == 0x2500 || cp == 0x2501 || cp == 0x2504 || cp == 0x2505 ||
+            cp == 0x2508 || cp == 0x2509 || cp == 0x254C || cp == 0x254D ||
+            cp == 0x2550) return '-';
+        // Vertical lines
+        if (cp == 0x2502 || cp == 0x2503 || cp == 0x2506 || cp == 0x2507 ||
+            cp == 0x250A || cp == 0x250B || cp == 0x254E || cp == 0x254F ||
+            cp == 0x2551) return '|';
+        // Everything else (corners, tees, crosses)
+        return '+';
+    }
+    // Block elements: U+2580-U+259F
+    if (cp >= 0x2580 && cp <= 0x259F) return '#';
+    // Common symbols
+    if (cp == 0x2713 || cp == 0x2714) return '*';  // checkmarks
+    if (cp == 0x2022 || cp == 0x25CF) return '*';  // bullets
+    if (cp == 0x25CB || cp == 0x25A0 || cp == 0x25A1) return '*';  // circles/squares
+    if (cp == 0x2192) return '>';  // right arrow
+    if (cp == 0x2190) return '<';  // left arrow
+    if (cp == 0x2191) return '^';  // up arrow
+    if (cp == 0x2193) return 'v';  // down arrow
+    if (cp == 0x2026) return '.';  // ellipsis
+    if (cp == 0x2014 || cp == 0x2013) return '-';  // em/en dash
+    if (cp == 0x2018 || cp == 0x2019) return '\''; // smart quotes
+    if (cp == 0x201C || cp == 0x201D) return '"';   // smart double quotes
+    return 0;  // unknown - skip
+}
+
+void enterAltScreen() {
+    if (term_alt_active) return;
+    // Save main buffer state
+    for (int i = 0; i < TERM_ROWS; i++)
+        memcpy(term_alt_buf[i], term_buf[i], TERM_COLS + 1);
+    saved_main_cursor_row = term_cursor_row;
+    saved_main_cursor_col = term_cursor_col;
+    saved_main_line_count = term_line_count;
+    saved_main_scroll = term_scroll;
+    // Clear screen for alt buffer
+    for (int i = 0; i < TERM_ROWS; i++) {
+        memset(term_buf[i], ' ', TERM_COLS);
+        term_buf[i][TERM_COLS] = '\0';
+    }
+    term_cursor_row = 0;
+    term_cursor_col = 0;
+    term_line_count = 1;
+    term_scroll = 0;
+    scroll_region_top = 0;
+    scroll_region_bot = ROWS_PER_SCREEN - 1;
+    scroll_region_set = false;
+    term_alt_active = true;
+}
+
+void leaveAltScreen() {
+    if (!term_alt_active) return;
+    // Restore main buffer
+    for (int i = 0; i < TERM_ROWS; i++)
+        memcpy(term_buf[i], term_alt_buf[i], TERM_COLS + 1);
+    term_cursor_row = saved_main_cursor_row;
+    term_cursor_col = saved_main_cursor_col;
+    term_line_count = saved_main_line_count;
+    term_scroll = saved_main_scroll;
+    scroll_region_top = 0;
+    scroll_region_bot = ROWS_PER_SCREEN - 1;
+    scroll_region_set = false;
+    term_alt_active = false;
 }
 
 void handleCSI(char final_char) {
     int p0 = (csi_param_count > 0) ? csi_params[0] : 0;
     int p1 = (csi_param_count > 1) ? csi_params[1] : 0;
+    int max_row = term_alt_active ? ROWS_PER_SCREEN : TERM_ROWS;
+
+    // Handle private mode sequences (CSI ? ...)
+    if (csi_private) {
+        if (final_char == 'h') {
+            // Set mode
+            for (int pi = 0; pi < csi_param_count; pi++) {
+                switch (csi_params[pi]) {
+                    case 1049: // Alt screen + save cursor
+                        saved_cursor_row = term_cursor_row;
+                        saved_cursor_col = term_cursor_col;
+                        enterAltScreen();
+                        break;
+                    case 47:   // Alt screen (no cursor save)
+                    case 1047:
+                        enterAltScreen();
+                        break;
+                    case 25:   // Show cursor
+                        cursor_visible = true;
+                        break;
+                }
+            }
+        } else if (final_char == 'l') {
+            // Reset mode
+            for (int pi = 0; pi < csi_param_count; pi++) {
+                switch (csi_params[pi]) {
+                    case 1049: // Leave alt screen + restore cursor
+                        leaveAltScreen();
+                        term_cursor_row = saved_cursor_row;
+                        term_cursor_col = saved_cursor_col;
+                        break;
+                    case 47:
+                    case 1047:
+                        leaveAltScreen();
+                        break;
+                    case 25:   // Hide cursor
+                        cursor_visible = false;
+                        break;
+                }
+            }
+        }
+        return;
+    }
 
     switch (final_char) {
         case 'A': // Cursor Up
@@ -300,7 +456,7 @@ void handleCSI(char final_char) {
             break;
         case 'B': // Cursor Down
             term_cursor_row += (p0 > 0) ? p0 : 1;
-            if (term_cursor_row >= TERM_ROWS) term_cursor_row = TERM_ROWS - 1;
+            if (term_cursor_row >= max_row) term_cursor_row = max_row - 1;
             break;
         case 'C': // Cursor Right
             term_cursor_col += (p0 > 0) ? p0 : 1;
@@ -310,31 +466,38 @@ void handleCSI(char final_char) {
             term_cursor_col -= (p0 > 0) ? p0 : 1;
             if (term_cursor_col < 0) term_cursor_col = 0;
             break;
+        case 'E': // Cursor Next Line
+            term_cursor_col = 0;
+            term_cursor_row += (p0 > 0) ? p0 : 1;
+            if (term_cursor_row >= max_row) term_cursor_row = max_row - 1;
+            break;
+        case 'F': // Cursor Previous Line
+            term_cursor_col = 0;
+            term_cursor_row -= (p0 > 0) ? p0 : 1;
+            if (term_cursor_row < 0) term_cursor_row = 0;
+            break;
         case 'H': // Cursor Position (row;col) — 1-based
         case 'f': // Same as H
             term_cursor_row = (p0 > 0) ? p0 - 1 : 0;
             term_cursor_col = (p1 > 0) ? p1 - 1 : 0;
-            if (term_cursor_row >= TERM_ROWS) term_cursor_row = TERM_ROWS - 1;
+            if (term_cursor_row >= max_row) term_cursor_row = max_row - 1;
             if (term_cursor_col >= TERM_COLS) term_cursor_col = TERM_COLS - 1;
             if (term_cursor_row >= term_line_count) term_line_count = term_cursor_row + 1;
             break;
         case 'J': // Erase in Display
             if (p0 == 0) {
-                // Clear from cursor to end of screen
                 memset(&term_buf[term_cursor_row][term_cursor_col], ' ',
                        TERM_COLS - term_cursor_col);
-                for (int r = term_cursor_row + 1; r < TERM_ROWS; r++) {
+                for (int r = term_cursor_row + 1; r < max_row; r++) {
                     memset(term_buf[r], ' ', TERM_COLS);
                 }
             } else if (p0 == 1) {
-                // Clear from start to cursor
                 for (int r = 0; r < term_cursor_row; r++) {
                     memset(term_buf[r], ' ', TERM_COLS);
                 }
                 memset(term_buf[term_cursor_row], ' ', term_cursor_col + 1);
             } else if (p0 == 2 || p0 == 3) {
-                // Clear entire screen
-                for (int r = 0; r < TERM_ROWS; r++) {
+                for (int r = 0; r < max_row; r++) {
                     memset(term_buf[r], ' ', TERM_COLS);
                 }
                 term_cursor_row = 0;
@@ -345,14 +508,11 @@ void handleCSI(char final_char) {
             break;
         case 'K': // Erase in Line
             if (p0 == 0) {
-                // Clear from cursor to end of line
                 memset(&term_buf[term_cursor_row][term_cursor_col], ' ',
                        TERM_COLS - term_cursor_col);
             } else if (p0 == 1) {
-                // Clear from start of line to cursor
                 memset(term_buf[term_cursor_row], ' ', term_cursor_col + 1);
             } else if (p0 == 2) {
-                // Clear entire line
                 memset(term_buf[term_cursor_row], ' ', TERM_COLS);
             }
             break;
@@ -362,7 +522,7 @@ void handleCSI(char final_char) {
             break;
         case 'd': // Cursor Vertical Absolute
             term_cursor_row = (p0 > 0) ? p0 - 1 : 0;
-            if (term_cursor_row >= TERM_ROWS) term_cursor_row = TERM_ROWS - 1;
+            if (term_cursor_row >= max_row) term_cursor_row = max_row - 1;
             if (term_cursor_row >= term_line_count) term_line_count = term_cursor_row + 1;
             break;
         case 'P': { // Delete Characters
@@ -383,38 +543,140 @@ void handleCSI(char final_char) {
             memset(&term_buf[r][c], ' ', n);
             break;
         }
-        case 'L': { // Insert Lines
+        case 'X': { // Erase Characters (overwrite with spaces, don't move cursor)
             int n = (p0 > 0) ? p0 : 1;
-            for (int j = TERM_ROWS - 1; j >= term_cursor_row + n; j--) {
+            int c = term_cursor_col;
+            if (c + n > TERM_COLS) n = TERM_COLS - c;
+            memset(&term_buf[term_cursor_row][c], ' ', n);
+            break;
+        }
+        case 'L': { // Insert Lines (within scroll region)
+            int n = (p0 > 0) ? p0 : 1;
+            int bot = (term_alt_active || scroll_region_set) ? scroll_region_bot : max_row - 1;
+            for (int j = bot; j >= term_cursor_row + n; j--) {
                 memcpy(term_buf[j], term_buf[j - n], TERM_COLS + 1);
             }
-            for (int j = term_cursor_row; j < term_cursor_row + n && j < TERM_ROWS; j++) {
+            for (int j = term_cursor_row; j < term_cursor_row + n && j <= bot; j++) {
                 memset(term_buf[j], ' ', TERM_COLS);
                 term_buf[j][TERM_COLS] = '\0';
             }
             break;
         }
-        case 'M': { // Delete Lines
+        case 'M': { // Delete Lines (within scroll region)
             int n = (p0 > 0) ? p0 : 1;
-            for (int j = term_cursor_row; j + n < TERM_ROWS; j++) {
+            int bot = (term_alt_active || scroll_region_set) ? scroll_region_bot : max_row - 1;
+            for (int j = term_cursor_row; j + n <= bot; j++) {
                 memcpy(term_buf[j], term_buf[j + n], TERM_COLS + 1);
             }
-            for (int j = TERM_ROWS - n; j < TERM_ROWS; j++) {
-                memset(term_buf[j], ' ', TERM_COLS);
-                term_buf[j][TERM_COLS] = '\0';
+            for (int j = bot - n + 1; j <= bot; j++) {
+                if (j >= 0) {
+                    memset(term_buf[j], ' ', TERM_COLS);
+                    term_buf[j][TERM_COLS] = '\0';
+                }
             }
             break;
         }
-        // m (SGR - colors/attributes), h/l (mode set/reset), r (scroll region)
-        // — ignored silently (no color on e-ink, modes not critical)
+        case 'S': { // Scroll Up (within scroll region)
+            int n = (p0 > 0) ? p0 : 1;
+            for (int j = 0; j < n; j++)
+                terminalScrollRegionUp(scroll_region_top, scroll_region_bot);
+            break;
+        }
+        case 'T': { // Scroll Down (within scroll region)
+            int n = (p0 > 0) ? p0 : 1;
+            for (int j = 0; j < n; j++)
+                terminalScrollRegionDown(scroll_region_top, scroll_region_bot);
+            break;
+        }
+        case 'r': { // Set Scroll Region (top;bottom, 1-based)
+            if (p0 == 0 && p1 == 0) {
+                // Reset scroll region
+                scroll_region_top = 0;
+                scroll_region_bot = ROWS_PER_SCREEN - 1;
+                scroll_region_set = false;
+            } else {
+                scroll_region_top = (p0 > 0) ? p0 - 1 : 0;
+                scroll_region_bot = (p1 > 0) ? p1 - 1 : ROWS_PER_SCREEN - 1;
+                if (scroll_region_top < 0) scroll_region_top = 0;
+                if (scroll_region_bot >= ROWS_PER_SCREEN) scroll_region_bot = ROWS_PER_SCREEN - 1;
+                if (scroll_region_top >= scroll_region_bot) {
+                    scroll_region_top = 0;
+                    scroll_region_bot = ROWS_PER_SCREEN - 1;
+                }
+                scroll_region_set = true;
+            }
+            term_cursor_row = 0;
+            term_cursor_col = 0;
+            break;
+        }
+        case 's': // Save cursor position
+            saved_cursor_row = term_cursor_row;
+            saved_cursor_col = term_cursor_col;
+            break;
+        case 'u': // Restore cursor position
+            term_cursor_row = saved_cursor_row;
+            term_cursor_col = saved_cursor_col;
+            break;
+        case 'h': // Set mode (non-private)
+        case 'l': // Reset mode (non-private)
+            break;  // ignore standard modes
         default:
             break;
+    }
+}
+
+// Handle cursor moving past bottom of scroll region or screen
+void terminalCursorDown() {
+    if (term_alt_active || scroll_region_set) {
+        // Screen-bounded mode: scroll region
+        if (term_cursor_row == scroll_region_bot) {
+            terminalScrollRegionUp(scroll_region_top, scroll_region_bot);
+        } else if (term_cursor_row < scroll_region_bot) {
+            term_cursor_row++;
+        }
+    } else {
+        // Main screen: scrollback mode
+        term_cursor_row++;
+        if (term_cursor_row >= TERM_ROWS) {
+            terminalScrollRegionUp(0, TERM_ROWS - 1);
+            term_cursor_row = TERM_ROWS - 1;
+        }
+        if (term_cursor_row >= term_line_count) {
+            term_line_count = term_cursor_row + 1;
+        }
+    }
+}
+
+void terminalPutChar(char ch) {
+    term_buf[term_cursor_row][term_cursor_col] = ch;
+    term_cursor_col++;
+    if (term_cursor_col >= TERM_COLS) {
+        term_cursor_col = 0;
+        terminalCursorDown();
     }
 }
 
 void terminalAppendOutput(const char* data, int len) {
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)data[i];
+
+        // UTF-8 multi-byte sequence continuation
+        if (utf8_remaining > 0) {
+            if ((c & 0xC0) == 0x80) {
+                utf8_codepoint = (utf8_codepoint << 6) | (c & 0x3F);
+                utf8_remaining--;
+                if (utf8_remaining == 0) {
+                    char mapped = unicodeToAscii(utf8_codepoint);
+                    if (mapped) terminalPutChar(mapped);
+                    // else skip unknown/zero-width characters
+                }
+            } else {
+                // Invalid continuation - reset and reprocess
+                utf8_remaining = 0;
+                i--; // reprocess this byte
+            }
+            continue;
+        }
 
         // ANSI escape sequence handling
         if (in_escape) {
@@ -423,6 +685,7 @@ void terminalAppendOutput(const char* data, int len) {
                     in_bracket = true;
                     csi_param_count = 0;
                     csi_parsing_num = false;
+                    csi_private = false;
                     memset(csi_params, 0, sizeof(csi_params));
                     continue;
                 }
@@ -430,10 +693,9 @@ void terminalAppendOutput(const char* data, int len) {
                     // OSC sequence — skip until ST (ESC \ or BEL)
                     in_escape = false;
                     in_bracket = false;
-                    // Scan ahead for BEL or ESC backslash
                     while (i + 1 < len) {
                         i++;
-                        if ((unsigned char)data[i] == 0x07) break; // BEL
+                        if ((unsigned char)data[i] == 0x07) break;
                         if ((unsigned char)data[i] == 0x1B && i + 1 < len && data[i+1] == '\\') {
                             i++;
                             break;
@@ -441,8 +703,45 @@ void terminalAppendOutput(const char* data, int len) {
                     }
                     continue;
                 }
-                // Single char after ESC (e.g. ESC M for reverse index)
+                // Single char after ESC
                 in_escape = false;
+                switch (c) {
+                    case 'M': // Reverse Index — cursor up, scroll region down if at top
+                        if (term_cursor_row == scroll_region_top) {
+                            terminalScrollRegionDown(scroll_region_top, scroll_region_bot);
+                        } else if (term_cursor_row > 0) {
+                            term_cursor_row--;
+                        }
+                        break;
+                    case 'D': // Index — cursor down, scroll region up if at bottom
+                        if (term_cursor_row == scroll_region_bot) {
+                            terminalScrollRegionUp(scroll_region_top, scroll_region_bot);
+                        } else {
+                            terminalCursorDown();
+                        }
+                        break;
+                    case 'E': // Next Line — cursor to start of next line
+                        term_cursor_col = 0;
+                        terminalCursorDown();
+                        break;
+                    case '7': // Save cursor
+                        saved_cursor_row = term_cursor_row;
+                        saved_cursor_col = term_cursor_col;
+                        break;
+                    case '8': // Restore cursor
+                        term_cursor_row = saved_cursor_row;
+                        term_cursor_col = saved_cursor_col;
+                        break;
+                    case 'c': // Full reset
+                        terminalClear();
+                        break;
+                    case '(': case ')': case '*': case '+':
+                        // Character set designation — skip next byte
+                        if (i + 1 < len) i++;
+                        break;
+                    default:
+                        break; // ignore unknown ESC sequences
+                }
                 continue;
             }
             // Inside ESC[ ... collecting parameters
@@ -463,7 +762,6 @@ void terminalAppendOutput(const char* data, int len) {
                     csi_param_count++;
                     csi_parsing_num = false;
                 } else {
-                    // Empty param (default 0)
                     if (csi_param_count < MAX_CSI_PARAMS) {
                         csi_params[csi_param_count] = 0;
                     }
@@ -471,8 +769,12 @@ void terminalAppendOutput(const char* data, int len) {
                 }
                 continue;
             }
-            if (c == '?' || c == '>' || c == '!') {
-                // Private mode prefix — continue collecting
+            if (c == '?') {
+                csi_private = true;
+                continue;
+            }
+            if (c == '>' || c == '!' || c == ' ') {
+                // Other prefixes/intermediates — continue collecting
                 continue;
             }
             // Final character — execute CSI sequence
@@ -493,16 +795,26 @@ void terminalAppendOutput(const char* data, int len) {
             continue;
         }
 
+        // UTF-8 start bytes
+        if ((c & 0xE0) == 0xC0) { // 2-byte sequence
+            utf8_codepoint = c & 0x1F;
+            utf8_remaining = 1;
+            continue;
+        }
+        if ((c & 0xF0) == 0xE0) { // 3-byte sequence
+            utf8_codepoint = c & 0x0F;
+            utf8_remaining = 2;
+            continue;
+        }
+        if ((c & 0xF8) == 0xF0) { // 4-byte sequence
+            utf8_codepoint = c & 0x07;
+            utf8_remaining = 3;
+            continue;
+        }
+
         if (c == '\n') {
-            term_cursor_row++;
             term_cursor_col = 0;
-            if (term_cursor_row >= TERM_ROWS) {
-                terminalScrollUp();
-                term_cursor_row = TERM_ROWS - 1;
-            }
-            if (term_cursor_row >= term_line_count) {
-                term_line_count = term_cursor_row + 1;
-            }
+            terminalCursorDown();
             continue;
         }
 
@@ -528,33 +840,17 @@ void terminalAppendOutput(const char* data, int len) {
             }
             if (term_cursor_col >= TERM_COLS) {
                 term_cursor_col = 0;
-                term_cursor_row++;
-                if (term_cursor_row >= TERM_ROWS) {
-                    terminalScrollUp();
-                    term_cursor_row = TERM_ROWS - 1;
-                }
+                terminalCursorDown();
             }
             continue;
         }
 
-        // Printable characters
+        // Printable ASCII characters
         if (c >= ' ' && c <= '~') {
-            term_buf[term_cursor_row][term_cursor_col] = (char)c;
-            term_cursor_col++;
-            if (term_cursor_col >= TERM_COLS) {
-                term_cursor_col = 0;
-                term_cursor_row++;
-                if (term_cursor_row >= TERM_ROWS) {
-                    terminalScrollUp();
-                    term_cursor_row = TERM_ROWS - 1;
-                }
-                if (term_cursor_row >= term_line_count) {
-                    term_line_count = term_cursor_row + 1;
-                }
-            }
+            terminalPutChar((char)c);
             continue;
         }
-        // Non-printable: ignore
+        // Non-printable / stray continuation bytes: ignore
     }
 
     // Auto-scroll to keep cursor visible
@@ -1106,7 +1402,7 @@ bool sshConnect() {
     }
 
     // Request PTY sized to our screen
-    if (ssh_channel_request_pty_size(ssh_chan, "vt100", TERM_COLS, ROWS_PER_SCREEN) != SSH_OK) {
+    if (ssh_channel_request_pty_size(ssh_chan, "xterm", TERM_COLS, ROWS_PER_SCREEN) != SSH_OK) {
         Serial.printf("SSH: pty request failed: %s\n", ssh_get_error(ssh_sess));
         ssh_channel_close(ssh_chan);
         ssh_channel_free(ssh_chan);
@@ -1261,7 +1557,7 @@ void sshSendString(const char* s, int len) {
 }
 
 void sshReceiveTask(void* param) {
-    char recv_buf[256];
+    char recv_buf[512];
     for (;;) {
         if (!ssh_connected || !ssh_chan) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -1272,6 +1568,14 @@ void sshReceiveTask(void* param) {
         if (nbytes > 0) {
             xSemaphoreTake(state_mutex, portMAX_DELAY);
             terminalAppendOutput(recv_buf, nbytes);
+            // Drain loop: keep reading to accumulate data before rendering
+            int total = nbytes;
+            for (int drain = 0; drain < 10 && total < 2048; drain++) {
+                nbytes = ssh_channel_read_nonblocking(ssh_chan, recv_buf, sizeof(recv_buf), 0);
+                if (nbytes <= 0) break;
+                terminalAppendOutput(recv_buf, nbytes);
+                total += nbytes;
+            }
             xSemaphoreGive(state_mutex);
             term_render_requested = true;
         } else if (nbytes == SSH_ERROR || ssh_channel_is_eof(ssh_chan)) {
@@ -1435,6 +1739,7 @@ void snapshotTerminalState() {
     term_snap_crow   = term_cursor_row;
     term_snap_ccol   = term_cursor_col;
     term_snap_lines  = term_line_count;
+    term_snap_cursor_visible = cursor_visible;
     // Only copy visible rows + 1 for safety
     int first = term_snap_scroll;
     int last = first + ROWS_PER_SCREEN;
@@ -1450,7 +1755,7 @@ void drawTerminalLines(int first_line, int last_line) {
     for (int sl = first_line; sl <= last_line && sl < ROWS_PER_SCREEN; sl++) {
         int buf_row = term_snap_scroll + sl;
         if (buf_row < 0 || buf_row >= TERM_ROWS) continue;
-        bool is_cursor_row = (buf_row == term_snap_crow);
+        bool is_cursor_row = term_snap_cursor_visible && (buf_row == term_snap_crow);
         int y = MARGIN_Y + sl * CHAR_H;
 
         // Find runs of non-space characters and print them in batches
