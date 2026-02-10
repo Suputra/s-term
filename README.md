@@ -1,6 +1,6 @@
 # T-Deck Pro Notepad
 
-Firmware for the LilyGo T-Deck Pro (ESP32-S3, 3.1" e-ink, keyboard) — a pocket notepad with SSH terminal, file manager, WireGuard VPN, and 4G modem support.
+Firmware for the LilyGo T-Deck Pro — a pocket notepad with SSH terminal, file manager and WireGuard VPN.
 
 ## Build & Flash
 
@@ -47,19 +47,12 @@ Type on the keyboard. Text wraps to the e-ink display.
 - **Shift** — sticky uppercase (one letter)
 - **Sym** — one-shot symbol/number layer
 - **Alt** — toggles nav mode (WASD = arrows, backspace = delete forward)
-- **Alt+F** — force full e-ink refresh
 
 ### Terminal
 
 Double-tap **MIC** to switch to terminal mode. The device connects WiFi, tries SSH directly, and if the host isn't reachable falls back through WireGuard VPN automatically. Double-tap **MIC** again to return to notepad.
 
-- **Alt+Q** — disconnect SSH
-- **Alt+W** — reconnect WiFi
-- **Alt+P** — paste notepad buffer into SSH session
-- **Alt+F** — force full e-ink refresh
-- **Alt+Space** — send Escape
-- **Alt+Enter** — send Tab
-- **Alt+letter** — send Ctrl+letter
+- **Alt** — acts as ctrl - alt + space -> esc
 
 ### Command Processor
 
