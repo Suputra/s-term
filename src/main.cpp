@@ -8,6 +8,7 @@
 #include <esp_task_wdt.h>
 #include <esp_sleep.h>
 #include <esp_netif.h>
+#include <lwip/dns.h>
 #include <driver/uart.h>
 #include <SD.h>
 #include <FS.h>
@@ -20,6 +21,7 @@ struct WiFiAP { char ssid[64]; char pass[64]; };
 static WiFiAP config_wifi[MAX_WIFI_APS];
 static int config_wifi_count = 0;
 static char config_ssh_host[64]   = "";
+static char config_ssh_vpn_host[64] = "";
 static int  config_ssh_port       = 22;
 static char config_ssh_user[64]   = "";
 static char config_ssh_pass[64]   = "";
@@ -31,9 +33,11 @@ static char   config_vpn_psk[64]     = "";
 static char   config_vpn_ip[32]      = "";
 static char   config_vpn_endpoint[64] = "";
 static int    config_vpn_port        = 51820;
+static char   config_vpn_dns[32]     = "";
 static WireGuard wg;
 static bool   vpn_connected = false;
 static bool vpnConfigured() { return config_vpn_privkey[0] != '\0'; }
+static bool vpnActive() { return vpn_connected && wg.is_initialized(); }
 
 // Forward declarations
 void connectMsg(const char* fmt, ...);
@@ -240,11 +244,15 @@ static ssh_session  ssh_sess    = NULL;
 static ssh_channel  ssh_chan     = NULL;
 static volatile bool ssh_connected = false;
 static TaskHandle_t ssh_recv_task_handle = NULL;
+static char ssh_last_host[64] = "";
 
 // --- WiFi State ---
 
 enum WifiState { WIFI_IDLE, WIFI_CONNECTING, WIFI_CONNECTED, WIFI_FAILED };
 static volatile WifiState wifi_state = WIFI_IDLE;
+#define WIFI_CONNECT_TIMEOUT_MS 15000
+static char wifi_last_fail_ssid[64] = "";
+static char wifi_last_fail_reason[64] = "";
 
 // --- Modem State ---
 
@@ -887,54 +895,121 @@ void sdLoadConfig() {
 
     // CONFIG format: section-based, # comments, blank lines skipped
     // # wifi — pairs of ssid/password (variable count)
-    // # ssh — host, port, user, pass
-    // # vpn — ENABLE, privkey, pubkey, psk, ip, endpoint, port
+    // # ssh — host, port, user, pass, [optional vpn-host]
+    // # vpn — ENABLE, privkey, pubkey, psk, ip, endpoint, port, [optional dns]
     enum { SEC_WIFI, SEC_SSH, SEC_VPN } section = SEC_WIFI;
     int field = 0;  // field index within current section
+    bool wifi_expect_ssid = true;
     char wifi_ssid[64] = "";
+
+    auto addWiFiAP = [&](const char* ssid, const char* pass) {
+        if (config_wifi_count >= MAX_WIFI_APS) return;
+        strncpy(config_wifi[config_wifi_count].ssid, ssid, 63);
+        config_wifi[config_wifi_count].ssid[63] = '\0';
+        strncpy(config_wifi[config_wifi_count].pass, pass, 63);
+        config_wifi[config_wifi_count].pass[63] = '\0';
+        Serial.printf("SD: WiFi AP added: %s%s\n",
+                      config_wifi[config_wifi_count].ssid,
+                      config_wifi[config_wifi_count].pass[0] ? "" : " (open)");
+        config_wifi_count++;
+    };
+
+    auto flushPendingOpenWiFi = [&]() {
+        if (section == SEC_WIFI && !wifi_expect_ssid) {
+            addWiFiAP(wifi_ssid, "");
+            wifi_expect_ssid = true;
+            wifi_ssid[0] = '\0';
+        }
+    };
 
     while (f.available()) {
         String line = f.readStringUntil('\n');
         line.trim();
-        if (line.length() == 0) continue;
+        if (line.length() == 0) {
+            // In WiFi section, blank password means open network.
+            flushPendingOpenWiFi();
+            continue;
+        }
         if (line[0] == '#') {
             // Section headers
-            if (line.indexOf("ssh") >= 0)      { section = SEC_SSH; field = 0; }
+            flushPendingOpenWiFi();
+            if (line.indexOf("wifi") >= 0)     { section = SEC_WIFI; field = 0; wifi_expect_ssid = true; wifi_ssid[0] = '\0'; }
+            else if (line.indexOf("ssh") >= 0) { section = SEC_SSH; field = 0; }
             else if (line.indexOf("vpn") >= 0) { section = SEC_VPN; field = 0; }
             continue;
         }
 
         if (section == SEC_WIFI) {
-            if (field % 2 == 0) {
+            if (wifi_expect_ssid) {
                 strncpy(wifi_ssid, line.c_str(), 63);
                 wifi_ssid[63] = '\0';
-            } else if (config_wifi_count < MAX_WIFI_APS) {
-                strncpy(config_wifi[config_wifi_count].ssid, wifi_ssid, 63);
-                strncpy(config_wifi[config_wifi_count].pass, line.c_str(), 63);
-                Serial.printf("SD: WiFi AP added: %s\n", wifi_ssid);
-                config_wifi_count++;
+                wifi_expect_ssid = false;
+            } else {
+                addWiFiAP(wifi_ssid, line.c_str());
+                wifi_expect_ssid = true;
+                wifi_ssid[0] = '\0';
             }
-            field++;
         } else if (section == SEC_SSH) {
             switch (field) {
-                case 0: strncpy(config_ssh_host, line.c_str(), 63); break;
+                case 0:
+                    strncpy(config_ssh_host, line.c_str(), 63);
+                    config_ssh_host[63] = '\0';
+                    break;
                 case 1: config_ssh_port = line.toInt(); break;
-                case 2: strncpy(config_ssh_user, line.c_str(), 63); break;
-                case 3: strncpy(config_ssh_pass, line.c_str(), 63); break;
+                case 2:
+                    strncpy(config_ssh_user, line.c_str(), 63);
+                    config_ssh_user[63] = '\0';
+                    break;
+                case 3:
+                    strncpy(config_ssh_pass, line.c_str(), 63);
+                    config_ssh_pass[63] = '\0';
+                    break;
+                case 4:
+                    strncpy(config_ssh_vpn_host, line.c_str(), 63);
+                    config_ssh_vpn_host[63] = '\0';
+                    break;
             }
             field++;
         } else if (section == SEC_VPN) {
+            // Backward compatibility: allow optional "ENABLE" line before VPN fields.
+            if (field == 0) {
+                String lowered = line;
+                lowered.toLowerCase();
+                if (lowered == "enable" || lowered == "enabled" || lowered == "true" || lowered == "1") {
+                    continue;
+                }
+            }
             switch (field) {
-                case 0: strncpy(config_vpn_privkey, line.c_str(), 63); break;
-                case 1: strncpy(config_vpn_pubkey, line.c_str(), 63); break;
-                case 2: strncpy(config_vpn_psk, line.c_str(), 63); break;
-                case 3: strncpy(config_vpn_ip, line.c_str(), 31); break;
-                case 4: strncpy(config_vpn_endpoint, line.c_str(), 63); break;
+                case 0:
+                    strncpy(config_vpn_privkey, line.c_str(), 63);
+                    config_vpn_privkey[63] = '\0';
+                    break;
+                case 1:
+                    strncpy(config_vpn_pubkey, line.c_str(), 63);
+                    config_vpn_pubkey[63] = '\0';
+                    break;
+                case 2:
+                    strncpy(config_vpn_psk, line.c_str(), 63);
+                    config_vpn_psk[63] = '\0';
+                    break;
+                case 3:
+                    strncpy(config_vpn_ip, line.c_str(), 31);
+                    config_vpn_ip[31] = '\0';
+                    break;
+                case 4:
+                    strncpy(config_vpn_endpoint, line.c_str(), 63);
+                    config_vpn_endpoint[63] = '\0';
+                    break;
                 case 5: config_vpn_port = line.toInt(); break;
+                case 6:
+                    strncpy(config_vpn_dns, line.c_str(), 31);
+                    config_vpn_dns[31] = '\0';
+                    break;
             }
             field++;
         }
     }
+    flushPendingOpenWiFi();
     f.close();
     Serial.printf("SD: config loaded (%d WiFi APs, host=%s, VPN=%s)\n",
                   config_wifi_count, config_ssh_host, vpnConfigured() ? "yes" : "no");
@@ -951,6 +1026,15 @@ struct FileEntry {
 #define MAX_FILE_LIST 50
 static FileEntry file_list[MAX_FILE_LIST];
 static int file_list_count = 0;
+static bool cmd_edit_picker_active = false;
+static int  cmd_edit_picker_indices[MAX_FILE_LIST];
+static int  cmd_edit_picker_count = 0;
+static int  cmd_edit_picker_selected = 0;
+static int  cmd_edit_picker_top = 0;
+
+int listDirectory(const char* path);
+bool loadFromFile(const char* path);
+void autoSaveDirty();
 
 void cmdClearResult() {
     cmd_result_count = 0;
@@ -976,6 +1060,126 @@ void cmdSetResult(const char* fmt, ...) {
     va_end(args);
     cmd_result_count = 1;
     cmd_result_valid = true;
+}
+
+int cmdEditPickerVisibleRows() {
+    int rows = CMD_RESULT_LINES - 1; // Reserve first line for picker status/help text
+    if (rows < 1) rows = 1;
+    return rows;
+}
+
+void cmdEditPickerStop() {
+    cmd_edit_picker_active = false;
+    cmd_edit_picker_count = 0;
+    cmd_edit_picker_selected = 0;
+    cmd_edit_picker_top = 0;
+}
+
+void cmdEditPickerSyncViewport() {
+    if (cmd_edit_picker_count <= 0) {
+        cmd_edit_picker_top = 0;
+        cmd_edit_picker_selected = 0;
+        return;
+    }
+    if (cmd_edit_picker_selected < 0) cmd_edit_picker_selected = 0;
+    if (cmd_edit_picker_selected >= cmd_edit_picker_count) cmd_edit_picker_selected = cmd_edit_picker_count - 1;
+
+    int rows = cmdEditPickerVisibleRows();
+    if (cmd_edit_picker_selected < cmd_edit_picker_top) {
+        cmd_edit_picker_top = cmd_edit_picker_selected;
+    } else if (cmd_edit_picker_selected >= cmd_edit_picker_top + rows) {
+        cmd_edit_picker_top = cmd_edit_picker_selected - rows + 1;
+    }
+
+    int max_top = cmd_edit_picker_count - rows;
+    if (max_top < 0) max_top = 0;
+    if (cmd_edit_picker_top < 0) cmd_edit_picker_top = 0;
+    if (cmd_edit_picker_top > max_top) cmd_edit_picker_top = max_top;
+}
+
+void cmdEditPickerRender() {
+    if (!cmd_edit_picker_active || cmd_edit_picker_count <= 0) {
+        cmdSetResult("(no files)");
+        return;
+    }
+
+    cmdEditPickerSyncViewport();
+    cmdClearResult();
+    cmdAddLine("Edit %d/%d W/S A/D Enter", cmd_edit_picker_selected + 1, cmd_edit_picker_count);
+
+    int rows = cmdEditPickerVisibleRows();
+    for (int i = 0; i < rows && cmd_result_count < CMD_RESULT_LINES; i++) {
+        int list_idx = cmd_edit_picker_top + i;
+        if (list_idx >= cmd_edit_picker_count) break;
+        const FileEntry& entry = file_list[cmd_edit_picker_indices[list_idx]];
+        cmdAddLine("%c%s %dB", (list_idx == cmd_edit_picker_selected) ? '>' : ' ', entry.name, (int)entry.size);
+    }
+}
+
+bool cmdEditPickerStart() {
+    int n = listDirectory("/");
+    if (n < 0) {
+        cmdEditPickerStop();
+        cmdSetResult("Can't read SD");
+        return false;
+    }
+
+    cmd_edit_picker_count = 0;
+    for (int i = 0; i < n && i < MAX_FILE_LIST; i++) {
+        if (!file_list[i].is_dir) {
+            cmd_edit_picker_indices[cmd_edit_picker_count++] = i;
+        }
+    }
+
+    if (cmd_edit_picker_count == 0) {
+        cmdEditPickerStop();
+        cmdSetResult("(no files)");
+        return false;
+    }
+
+    cmd_edit_picker_active = true;
+    cmd_edit_picker_selected = 0;
+    cmd_edit_picker_top = 0;
+    cmdEditPickerRender();
+    return true;
+}
+
+bool cmdEditPickerMoveSelection(int delta) {
+    if (!cmd_edit_picker_active || cmd_edit_picker_count <= 0) return false;
+    int next = cmd_edit_picker_selected + delta;
+    if (next < 0) next = 0;
+    if (next >= cmd_edit_picker_count) next = cmd_edit_picker_count - 1;
+    if (next == cmd_edit_picker_selected) return false;
+    cmd_edit_picker_selected = next;
+    cmdEditPickerRender();
+    return true;
+}
+
+bool cmdEditPickerPage(int direction) {
+    int rows = cmdEditPickerVisibleRows();
+    if (rows < 1) rows = 1;
+    return cmdEditPickerMoveSelection(direction * rows);
+}
+
+bool cmdEditPickerOpenSelected() {
+    if (!cmd_edit_picker_active || cmd_edit_picker_count <= 0) return false;
+
+    int list_idx = cmd_edit_picker_selected;
+    if (list_idx < 0 || list_idx >= cmd_edit_picker_count) return false;
+    const FileEntry& entry = file_list[cmd_edit_picker_indices[list_idx]];
+
+    autoSaveDirty();
+    String path = "/" + String(entry.name);
+    bool ok = loadFromFile(path.c_str());
+    cmdEditPickerStop();
+    if (ok) {
+        current_file = path;
+        cmdSetResult("Loaded %s (%d B)", entry.name, text_len);
+        app_mode = MODE_NOTEPAD;
+    } else {
+        cmdSetResult("Load failed: %s", entry.name);
+    }
+    return true;
 }
 
 int listDirectory(const char* path) {
@@ -1041,18 +1245,70 @@ void autoSaveDirty() {
 
 // --- WiFi ---
 
-// Try connecting to a single AP, returns true if connected within timeout
-bool wifiTryAP(const char* ssid, const char* pass, int timeout_ms) {
+struct WiFiAttemptResult {
+    bool connected;
+    wl_status_t status;
+    bool timed_out;
+};
+
+const char* wifiStatusReason(wl_status_t status) {
+    switch (status) {
+        case WL_NO_SSID_AVAIL:   return "SSID not found";
+        case WL_CONNECT_FAILED:  return "auth failed";
+        case WL_CONNECTION_LOST: return "link lost";
+        case WL_DISCONNECTED:    return "disconnected";
+        case WL_IDLE_STATUS:     return "idle";
+        case WL_SCAN_COMPLETED:  return "scan complete";
+        case WL_CONNECTED:       return "connected";
+        default:                 return "unknown";
+    }
+}
+
+void wifiClearLastFailure() {
+    wifi_last_fail_ssid[0] = '\0';
+    wifi_last_fail_reason[0] = '\0';
+}
+
+void wifiSetLastFailure(const char* ssid, const char* reason) {
+    strncpy(wifi_last_fail_ssid, ssid, sizeof(wifi_last_fail_ssid) - 1);
+    wifi_last_fail_ssid[sizeof(wifi_last_fail_ssid) - 1] = '\0';
+    strncpy(wifi_last_fail_reason, reason, sizeof(wifi_last_fail_reason) - 1);
+    wifi_last_fail_reason[sizeof(wifi_last_fail_reason) - 1] = '\0';
+}
+
+void wifiFormatFailureReason(const WiFiAttemptResult& result, char* out, size_t out_len) {
+    if (result.timed_out) {
+        snprintf(out, out_len, "timeout (%s)", wifiStatusReason(result.status));
+    } else {
+        snprintf(out, out_len, "%s", wifiStatusReason(result.status));
+    }
+}
+
+int wifiConfigIndexForSSID(const String& ssid) {
+    for (int i = 0; i < config_wifi_count; i++) {
+        if (ssid == config_wifi[i].ssid) return i;
+    }
+    return -1;
+}
+
+// Try connecting to a single AP and capture final status/reason.
+WiFiAttemptResult wifiTryAP(const char* ssid, const char* pass, int timeout_ms) {
     WiFi.disconnect();
     vTaskDelay(pdMS_TO_TICKS(50));
-    WiFi.begin(ssid, pass);
+    if (pass && pass[0] != '\0') WiFi.begin(ssid, pass);
+    else                         WiFi.begin(ssid);
     int elapsed = 0;
     while (elapsed < timeout_ms) {
-        if (WiFi.status() == WL_CONNECTED) return true;
+        wl_status_t st = WiFi.status();
+        if (st == WL_CONNECTED) return { true, st, false };
+        if (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED || st == WL_CONNECTION_LOST) {
+            return { false, st, false };
+        }
         vTaskDelay(pdMS_TO_TICKS(250));
         elapsed += 250;
     }
-    return WiFi.status() == WL_CONNECTED;
+    wl_status_t final_status = WiFi.status();
+    return { final_status == WL_CONNECTED, final_status, true };
 }
 
 void wifiConnect() {
@@ -1283,6 +1539,7 @@ void sshDisconnect() {
         ssh_free(ssh_sess);
         ssh_sess = NULL;
     }
+    ssh_last_host[0] = '\0';
     Serial.println("SSH: disconnected");
 }
 
@@ -1293,35 +1550,78 @@ bool hasNetwork() {
     return (wifi_state == WIFI_CONNECTED) || (modem_state == MODEM_PPP_UP);
 }
 
-bool vpnConnect() {
-    if (vpn_connected) return true;
+void vpnDisconnect() {
+    if (wg.is_initialized()) {
+        wg.end();
+    }
+    vpn_connected = false;
+}
+
+bool vpnConnect(bool force_reinit) {
+    if (vpnActive() && !force_reinit) return true;
+    if (wg.is_initialized()) {
+        connectMsg("VPN: reinit...");
+        wg.end();
+        vpn_connected = false;
+    }
+    if (!vpnConfigured()) {
+        connectMsg("VPN: not configured");
+        return false;
+    }
+    if (config_vpn_pubkey[0] == '\0' || config_vpn_ip[0] == '\0' || config_vpn_endpoint[0] == '\0' || config_vpn_port <= 0) {
+        connectMsg("VPN: bad config");
+        return false;
+    }
     connectMsg("VPN: NTP sync...");
     configTime(0, 0, "pool.ntp.org", "time.google.com");
     struct tm tm;
     int tries = 0;
     while (!getLocalTime(&tm) && tries++ < 10) delay(500);
     if (tries >= 10) {
+        vpn_connected = false;
         connectMsg("VPN: NTP failed");
         return false;
     }
     connectMsg("VPN: connecting...");
     IPAddress local_ip;
-    local_ip.fromString(config_vpn_ip);
+    if (!local_ip.fromString(config_vpn_ip)) {
+        vpn_connected = false;
+        connectMsg("VPN: bad IP %s", config_vpn_ip);
+        return false;
+    }
     const char* psk = config_vpn_psk[0] ? config_vpn_psk : NULL;
-    wg.begin(local_ip, config_vpn_privkey, config_vpn_endpoint,
-             config_vpn_pubkey, config_vpn_port, psk);
+    if (!wg.begin(local_ip, config_vpn_privkey, config_vpn_endpoint,
+                  config_vpn_pubkey, config_vpn_port, psk)) {
+        vpn_connected = false;
+        connectMsg("VPN: connect failed");
+        return false;
+    }
     vpn_connected = true;
+    if (config_vpn_dns[0] != '\0') {
+        IPAddress dns_ip;
+        if (dns_ip.fromString(config_vpn_dns)) {
+            ip_addr_t dns_addr = IPADDR4_INIT(static_cast<uint32_t>(dns_ip));
+            dns_setserver(0, &dns_addr);
+            connectMsg("VPN DNS: %s", config_vpn_dns);
+        } else {
+            connectMsg("VPN DNS: bad %s", config_vpn_dns);
+        }
+    }
     connectMsg("VPN: %s", config_vpn_ip);
     return true;
 }
 
-bool sshTryConnect() {
-    Serial.printf("SSH: connecting to %s:%d...\n", config_ssh_host, config_ssh_port);
+bool sshTryConnect(const char* host) {
+    if (!host || host[0] == '\0') {
+        connectMsg("SSH: missing host");
+        return false;
+    }
+    Serial.printf("SSH: connecting to %s:%d...\n", host, config_ssh_port);
 
     ssh_sess = ssh_new();
     if (!ssh_sess) return false;
 
-    ssh_options_set(ssh_sess, SSH_OPTIONS_HOST, config_ssh_host);
+    ssh_options_set(ssh_sess, SSH_OPTIONS_HOST, host);
     int port = config_ssh_port;
     ssh_options_set(ssh_sess, SSH_OPTIONS_PORT, &port);
     ssh_options_set(ssh_sess, SSH_OPTIONS_USER, config_ssh_user);
@@ -1329,7 +1629,11 @@ bool sshTryConnect() {
     ssh_options_set(ssh_sess, SSH_OPTIONS_TIMEOUT, &timeout);
 
     if (ssh_connect(ssh_sess) != SSH_OK) {
-        Serial.printf("SSH: connect failed: %s\n", ssh_get_error(ssh_sess));
+        const char* err = ssh_get_error(ssh_sess);
+        Serial.printf("SSH: connect failed: %s\n", err ? err : "(unknown)");
+        if (err && strstr(err, "resolve hostname")) {
+            connectMsg("SSH: DNS fail %s", host);
+        }
         ssh_free(ssh_sess);
         ssh_sess = NULL;
         return false;
@@ -1358,26 +1662,66 @@ bool sshConnect() {
     // Clean up any previous session
     sshDisconnect();
 
-    // Try direct SSH first
-    connectMsg("SSH: %s:%d...", config_ssh_host, config_ssh_port);
-    if (sshTryConnect()) {
-        connectMsg("SSH: connected");
-    } else if (vpnConfigured() && !vpn_connected) {
-        // Direct failed, try VPN
-        connectMsg("SSH: direct failed");
-        if (!vpnConnect()) {
-            connectMsg("SSH: VPN failed");
-            return false;
+    const char* direct_host = config_ssh_host;
+    const char* vpn_host = config_ssh_vpn_host[0] ? config_ssh_vpn_host : config_ssh_host;
+    const bool vpn_only = vpnActive();
+
+    if (vpn_only) {
+        bool vpn_ssh_ok = false;
+        connectMsg("SSH: %s (VPN)...", vpn_host);
+        vpn_ssh_ok = sshTryConnect(vpn_host);
+        if (!vpn_ssh_ok) {
+            connectMsg("VPN: reinit...");
+            if (vpnConnect(true)) {
+                connectMsg("SSH: %s (VPN)...", vpn_host);
+                vpn_ssh_ok = sshTryConnect(vpn_host);
+            }
         }
-        connectMsg("SSH: %s (VPN)...", config_ssh_host);
-        if (!sshTryConnect()) {
+        if (!vpn_ssh_ok) {
             connectMsg("SSH: failed via VPN");
             return false;
         }
+        strncpy(ssh_last_host, vpn_host, sizeof(ssh_last_host) - 1);
+        ssh_last_host[sizeof(ssh_last_host) - 1] = '\0';
         connectMsg("SSH: connected (VPN)");
-    } else {
-        connectMsg("SSH: failed");
-        return false;
+    } else
+
+    {
+        // Try direct SSH first
+        connectMsg("SSH: %s:%d...", direct_host, config_ssh_port);
+        if (sshTryConnect(direct_host)) {
+            strncpy(ssh_last_host, direct_host, sizeof(ssh_last_host) - 1);
+            ssh_last_host[sizeof(ssh_last_host) - 1] = '\0';
+            connectMsg("SSH: connected");
+        } else if (vpnConfigured()) {
+            // Direct failed, try VPN
+            connectMsg("SSH: direct failed");
+            if (!vpnConnect(false)) {
+                connectMsg("SSH: VPN failed");
+                return false;
+            }
+
+            bool vpn_ssh_ok = false;
+            connectMsg("SSH: %s (VPN)...", vpn_host);
+            vpn_ssh_ok = sshTryConnect(vpn_host);
+            if (!vpn_ssh_ok && vpnActive()) {
+                connectMsg("VPN: reinit...");
+                if (vpnConnect(true)) {
+                    connectMsg("SSH: %s (VPN)...", vpn_host);
+                    vpn_ssh_ok = sshTryConnect(vpn_host);
+                }
+            }
+            if (!vpn_ssh_ok) {
+                connectMsg("SSH: failed via VPN");
+                return false;
+            }
+            strncpy(ssh_last_host, vpn_host, sizeof(ssh_last_host) - 1);
+            ssh_last_host[sizeof(ssh_last_host) - 1] = '\0';
+            connectMsg("SSH: connected (VPN)");
+        } else {
+            connectMsg("SSH: failed");
+            return false;
+        }
     }
 
     ssh_chan = ssh_channel_new(ssh_sess);
@@ -1470,42 +1814,24 @@ void sshConnectTask(void* param) {
     if (wifi_state != WIFI_CONNECTED) {
         WiFi.mode(WIFI_STA);
         bool connected = false;
+        wifiClearLastFailure();
 
-        // Try each known AP in config order
-        for (int i = 0; i < config_wifi_count && !connected; i++) {
-            connectMsg("WiFi: %s...", config_wifi[i].ssid);
-            if (wifiTryAP(config_wifi[i].ssid, config_wifi[i].pass, 5000)) {
-                connected = true;
-            } else {
-                connectMsg("  failed");
-            }
-        }
-
-        // If all failed, scan and try best match
-        if (!connected) {
-            connectMsg("WiFi: scanning...");
-            int n = WiFi.scanNetworks();
-            if (n > 0) {
-                for (int i = 0; i < n && i < 4; i++) {
-                    connectMsg("  %s (%ddBm)", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+        if (config_wifi_count == 0) {
+            connectMsg("WiFi: no APs in /CONFIG");
+        } else {
+            // Try each known AP in config order.
+            for (int i = 0; i < config_wifi_count && !connected; i++) {
+                connectMsg("WiFi: %s...", config_wifi[i].ssid);
+                WiFiAttemptResult attempt = wifiTryAP(config_wifi[i].ssid, config_wifi[i].pass, WIFI_CONNECT_TIMEOUT_MS);
+                if (attempt.connected) {
+                    connected = true;
+                    wifiClearLastFailure();
+                } else {
+                    char reason[48];
+                    wifiFormatFailureReason(attempt, reason, sizeof(reason));
+                    connectMsg("  failed: %s", reason);
+                    wifiSetLastFailure(config_wifi[i].ssid, reason);
                 }
-                // Try known APs sorted by signal strength
-                for (int rssi_thresh = 0; rssi_thresh > -100 && !connected; rssi_thresh -= 10) {
-                    for (int i = 0; i < n && !connected; i++) {
-                        if (WiFi.RSSI(i) < rssi_thresh - 10 || WiFi.RSSI(i) >= rssi_thresh) continue;
-                        for (int j = 0; j < config_wifi_count; j++) {
-                            if (WiFi.SSID(i) == config_wifi[j].ssid) {
-                                connectMsg("WiFi: %s...", config_wifi[j].ssid);
-                                WiFi.scanDelete();
-                                if (wifiTryAP(config_wifi[j].ssid, config_wifi[j].pass, 5000)) {
-                                    connected = true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (!connected) WiFi.scanDelete();
             }
         }
 
@@ -1513,7 +1839,13 @@ void sshConnectTask(void* param) {
             wifi_state = WIFI_CONNECTED;
             connectMsg("WiFi: %s (%s)", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
         } else {
+            wifi_state = WIFI_FAILED;
             connectMsg("WiFi: all failed");
+            if (wifi_last_fail_ssid[0] != '\0') {
+                connectMsg("Last: %s", wifi_last_fail_ssid);
+                connectMsg("Why: %s", wifi_last_fail_reason);
+            }
+            connectMsg("Use cmd: scan");
             ssh_connecting = false;
             vTaskDelete(NULL);
             return;
@@ -1812,10 +2144,11 @@ void drawTerminalStatusBar() {
     char status[60];
     // Build compact connection string
     if (ssh_connecting) {
-        snprintf(status, sizeof(status), vpn_connected ? "VPN SSH..." : "SSH...");
+        snprintf(status, sizeof(status), vpnActive() ? "VPN SSH..." : "SSH...");
     } else if (ssh_connected) {
-        const char* net = vpn_connected ? "VPN" : (modem_state == MODEM_PPP_UP) ? "4G" : "WiFi";
-        snprintf(status, sizeof(status), "%s %s@%s", net, config_ssh_user, config_ssh_host);
+        const char* net = vpnActive() ? "VPN" : (modem_state == MODEM_PPP_UP) ? "4G" : "WiFi";
+        const char* host = ssh_last_host[0] ? ssh_last_host : config_ssh_host;
+        snprintf(status, sizeof(status), "%s %s@%s", net, config_ssh_user, host);
     } else if (modem_state == MODEM_PPP_UP) {
         snprintf(status, sizeof(status), "4G OK");
     } else if (modem_state >= MODEM_POWERING_ON && modem_state <= MODEM_REGISTERED) {
@@ -2616,6 +2949,83 @@ void powerOff() {
 
 // --- Command Processor ---
 
+void wifiScanCommand() {
+    WiFi.mode(WIFI_STA);
+    int n = WiFi.scanNetworks();
+    if (n < 0) {
+        cmdSetResult("Scan failed");
+        return;
+    }
+    if (n == 0) {
+        cmdSetResult("No WiFi networks found");
+        return;
+    }
+
+    cmdClearResult();
+    cmdAddLine("Scan: %d network(s)", n);
+    for (int i = 0; i < n && i < 6; i++) {
+        int cfg_idx = wifiConfigIndexForSSID(WiFi.SSID(i));
+        cmdAddLine("%c %s %ddBm",
+                   cfg_idx >= 0 ? '*' : ' ',
+                   WiFi.SSID(i).c_str(),
+                   WiFi.RSSI(i));
+    }
+
+    bool connected = false;
+    bool tried_known = false;
+    bool tried_cfg[MAX_WIFI_APS] = { false };
+    for (;;) {
+        int best_cfg = -1;
+        int best_rssi = -1000;
+        for (int i = 0; i < n; i++) {
+            int cfg_idx = wifiConfigIndexForSSID(WiFi.SSID(i));
+            if (cfg_idx < 0 || tried_cfg[cfg_idx]) continue;
+            if (WiFi.RSSI(i) > best_rssi) {
+                best_rssi = WiFi.RSSI(i);
+                best_cfg = cfg_idx;
+            }
+        }
+        if (best_cfg < 0) break;
+
+        tried_known = true;
+        tried_cfg[best_cfg] = true;
+        cmdAddLine("Try: %s", config_wifi[best_cfg].ssid);
+        WiFiAttemptResult attempt = wifiTryAP(config_wifi[best_cfg].ssid, config_wifi[best_cfg].pass, WIFI_CONNECT_TIMEOUT_MS);
+        if (attempt.connected) {
+            connected = true;
+            wifi_state = WIFI_CONNECTED;
+            wifiClearLastFailure();
+            cmdAddLine("WiFi: %s", WiFi.localIP().toString().c_str());
+            break;
+        } else {
+            char reason[48];
+            wifiFormatFailureReason(attempt, reason, sizeof(reason));
+            wifi_state = WIFI_FAILED;
+            wifiSetLastFailure(config_wifi[best_cfg].ssid, reason);
+            cmdAddLine("  fail: %s", reason);
+        }
+    }
+
+    if (!connected) {
+        if (WiFi.status() == WL_CONNECTED) {
+            wifi_state = WIFI_CONNECTED;
+            cmdAddLine("WiFi: %s", WiFi.SSID().c_str());
+        } else {
+            wifi_state = WIFI_FAILED;
+            if (!tried_known) {
+                cmdAddLine("No known SSIDs in scan");
+            } else {
+                cmdAddLine("Known APs failed");
+                if (wifi_last_fail_ssid[0] != '\0') {
+                    cmdAddLine("%s: %s", wifi_last_fail_ssid, wifi_last_fail_reason);
+                }
+            }
+        }
+    }
+
+    WiFi.scanDelete();
+}
+
 void executeCommand(const char* cmd) {
     // Parse command word and argument
     char word[CMD_BUF_LEN + 1];
@@ -2652,8 +3062,10 @@ void executeCommand(const char* cmd) {
             if (n > CMD_RESULT_LINES) cmdAddLine("... +%d more", n - CMD_RESULT_LINES);
         }
     } else if (strcmp(word, "e") == 0 || strcmp(word, "edit") == 0) {
-        if (arg[0] == '\0') { cmdSetResult("e <file>"); }
-        else {
+        if (arg[0] == '\0') {
+            cmdEditPickerStart();
+        } else {
+            cmdEditPickerStop();
             autoSaveDirty();
             String path = "/" + String(arg);
             if (loadFromFile(path.c_str())) {
@@ -2739,6 +3151,8 @@ void executeCommand(const char* cmd) {
     } else if (strcmp(word, "dc") == 0) {
         sshDisconnect();
         cmdSetResult("Disconnected");
+    } else if (strcmp(word, "ws") == 0 || strcmp(word, "scan") == 0) {
+        wifiScanCommand();
     } else if (strcmp(word, "f") == 0 || strcmp(word, "refresh") == 0) {
         partial_count = 100;
         cmdSetResult("Full refresh queued");
@@ -2756,12 +3170,17 @@ void executeCommand(const char* cmd) {
         const char* ws = "off";
         if (wifi_state == WIFI_CONNECTED) ws = "ok";
         else if (wifi_state == WIFI_CONNECTING) ws = "...";
+        else if (wifi_state == WIFI_FAILED) ws = "fail";
         const char* ms = "off";
         if (modem_state == MODEM_PPP_UP) ms = "ok";
         else if (modem_state >= MODEM_POWERING_ON && modem_state <= MODEM_REGISTERED) ms = "...";
         else if (modem_state == MODEM_FAILED) ms = "fail";
         cmdClearResult();
         cmdAddLine("WiFi:%s 4G:%s SSH:%s", ws, ms, ssh_connected ? "ok" : "off");
+        if (wifi_last_fail_ssid[0] != '\0') {
+            cmdAddLine("WiFi fail:%s", wifi_last_fail_ssid);
+            cmdAddLine("Why:%s", wifi_last_fail_reason);
+        }
         cmdAddLine("Bat:%d%% Heap:%dK", battery_pct, ESP.getFreeHeap() / 1024);
         if (current_file.length() > 0) cmdAddLine("File:%s%s", current_file.c_str(), file_modified ? "*" : "");
     } else if (strcmp(word, "off") == 0) {
@@ -2770,7 +3189,8 @@ void executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("(l)ist (e)dit (w)rite (n)ew");
         cmdAddLine("(r)m (u)pload (d)ownload");
-        cmdAddLine("(p)aste dc re(f)resh (4)g off (h)elp");
+        cmdAddLine("(p)aste dc (ws)/scan re(f)resh");
+        cmdAddLine("(4)g (s)tatus off (h)elp");
     } else {
         cmdSetResult("Unknown: %s (?=help)", word);
     }
@@ -2784,6 +3204,31 @@ bool handleCommandKeyPress(int event_code) {
     int col_rev = (KEYPAD_COLS - 1) - col_raw;
 
     if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
+
+    if (cmd_edit_picker_active) {
+        if (IS_MIC(row, col_rev)) {
+            cmdEditPickerStop();
+            app_mode = cmd_return_mode;
+            return false;
+        }
+        if (IS_SHIFT(row, col_rev) || IS_SYM(row, col_rev) || IS_ALT(row, col_rev) || IS_DEAD(row, col_rev)) {
+            return false;
+        }
+
+        char base = keymap_lower[row][col_rev];
+        if (base == 0) return false;
+        if (base == 'w') return cmdEditPickerMoveSelection(-1);
+        if (base == 's') return cmdEditPickerMoveSelection(1);
+        if (base == 'a') return cmdEditPickerPage(-1);
+        if (base == 'd') return cmdEditPickerPage(1);
+        if (base == '\n') return cmdEditPickerOpenSelected();
+        if (base == '\b') {
+            cmdEditPickerStop();
+            cmdSetResult("Edit cancelled");
+            return true;
+        }
+        return false;
+    }
 
     if (IS_SHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
     if (IS_SYM(row, col_rev))   { sym_mode = true; return true; }
@@ -2867,11 +3312,15 @@ void renderCommandPrompt() {
         // Draw prompt line at bottom of command area (above status bar)
         int py = SCREEN_H - STATUS_H - CHAR_H - 2;
         display.setCursor(MARGIN_X, py);
-        display.print("> ");
-        display.print(cmd_buf);
-        // Cursor
-        int cx = MARGIN_X + (cmd_len + 2) * CHAR_W;
-        display.fillRect(cx, py - 1, CHAR_W, CHAR_H, GxEPD_BLACK);
+        if (cmd_edit_picker_active) {
+            display.print("> edit");
+        } else {
+            display.print("> ");
+            display.print(cmd_buf);
+            // Cursor
+            int cx = MARGIN_X + (cmd_len + 2) * CHAR_W;
+            display.fillRect(cx, py - 1, CHAR_W, CHAR_H, GxEPD_BLACK);
+        }
 
         // Status bar
         int bar_y = SCREEN_H - STATUS_H;
@@ -2886,6 +3335,8 @@ void renderCommandPrompt() {
             char dl[40];
             snprintf(dl, sizeof(dl), "Download: %d/%d", (int)download_done_count, (int)download_total_count);
             display.print(dl);
+        } else if (cmd_edit_picker_active) {
+            display.print("[PICK] WASD nav ENTER open");
         } else {
             display.print("[CMD] ? help | MIC exit");
         }
@@ -2994,6 +3445,7 @@ void loop() {
         cmd_len = 0;
         cmd_buf[0] = '\0';
         cmd_result_valid = false;
+        cmdEditPickerStop();
         app_mode = MODE_COMMAND;
         xSemaphoreGive(state_mutex);
         render_requested = true;

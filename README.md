@@ -33,9 +33,11 @@ source scripts/setup-pio.sh
 Credentials are loaded from a `/CONFIG` file on the SD card (FAT32). Section-based format with `#` comments and blank lines ignored. Section headers are `# wifi`, `# ssh`, `# vpn`.
 
 ```
-# wifi (multiple SSID/password pairs, connects to strongest)
+# wifi (SSID/password pairs; blank or missing password means open WiFi)
 home_ssid
 home_password
+office_guest_open
+
 phone_hotspot
 hotspot_password
 
@@ -44,6 +46,9 @@ hotspot_password
 22
 user
 password
+# optional: host to use only when SSH is attempted via VPN
+# (useful if direct host is a local shortname that doesn't resolve over tunnel DNS)
+10.207.162.10
 
 # vpn (omit section if not using VPN)
 <device_private_key_base64>
@@ -52,7 +57,11 @@ password
 <device_vpn_ip>
 <endpoint_host_or_ip>
 51820
+# optional: DNS server to use while VPN is active
+10.0.0.1
 ```
+
+Open WiFi entries: put only the SSID and leave the password line blank (or end the WiFi section right after the SSID).
 
 ## Usage
 
@@ -77,7 +86,7 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | Command | Description |
 |---------|-------------|
 | `l` / `ls` | List files on SD card |
-| `e` / `edit <file>` | Edit a file (loads into notepad) |
+| `e` / `edit [file]` | Edit a file (loads into notepad). With no filename, opens interactive picker (W/S move, A/D page, Enter open). |
 | `w` / `save` | Save notepad to current file |
 | `n` / `new` | New file (auto-saves current) |
 | `r` / `rm <file>` | Delete a file |
@@ -85,6 +94,7 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `d` / `download` | SCP `~/tdeck` files to SD card |
 | `p` / `paste` | Paste notepad to SSH |
 | `dc` | Disconnect SSH |
+| `ws` / `scan` | Scan WiFi and retry known APs manually |
 | `f` / `refresh` | Force full e-ink refresh |
 | `4` / `4g` | Toggle 4G modem |
 | `s` / `status` | Show WiFi/SSH/VPN/battery status |
