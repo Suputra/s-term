@@ -6,29 +6,26 @@ Firmware for the LilyGo T-Deck Pro — a pocket notepad with SSH terminal, file 
 
 Requires [PlatformIO](https://platformio.org/). All dependencies are fetched automatically on first build.
 
-### Using `uv` (no virtualenv)
+### Quick setup (`uv`, no virtualenv)
 
-Install `platformio` as a `uv` tool, keeping cache/tools/core files in this repo:
-
-```bash
-UV_CACHE_DIR=.uv-cache UV_TOOL_DIR=.uv-tools UV_TOOL_BIN_DIR=.uv-bin PLATFORMIO_CORE_DIR=.platformio \
-  uv tool install --force platformio
-```
-
-Build / flash / monitor:
+Run this once:
 
 ```bash
-PATH="$(pwd)/.uv-bin:$PATH" PLATFORMIO_CORE_DIR=.platformio pio run
-PATH="$(pwd)/.uv-bin:$PATH" PLATFORMIO_CORE_DIR=.platformio pio run -t upload
-PATH="$(pwd)/.uv-bin:$PATH" PLATFORMIO_CORE_DIR=.platformio pio device monitor
+uv tool install --force platformio && uv tool update-shell && export PATH="$(uv tool dir --bin):$PATH" && hash -r
 ```
 
-### Using an existing `pio` install
+After that, use plain `pio` commands:
 
 ```bash
 pio run              # build
 pio run -t upload    # flash via USB-C
 pio device monitor   # serial output
+```
+
+Alternative setup script:
+
+```bash
+source scripts/setup-pio.sh
 ```
 
 ## SD Card Config
