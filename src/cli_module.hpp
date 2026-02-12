@@ -1,5 +1,7 @@
 // --- Command Processor ---
 
+#include "poweroff_art_shaded.hpp"
+
 // --- SCP Upload ---
 
 static volatile bool upload_running = false;
@@ -255,12 +257,10 @@ static const char poweroff_art[] PROGMEM =
     "WNWWWWWWWWWk;,'''.........',,;;;;,,,,,,,'............'''''',,,;::,''''.'''',,'''''''''...'''.':::;'.......'',:c,,:cc::;;,,,,,,\n";
 
 #define POWEROFF_ART_LINES 92
-#define POWEROFF_ART_PX_W  2
-#define POWEROFF_ART_PX_H  3
 
 void powerOff() {
     // Render ASCII art as pixel bitmap on e-ink, then deep sleep
-    const int art_height = POWEROFF_ART_LINES * POWEROFF_ART_PX_H;
+    const int art_height = POWEROFF_ART_LINES * POWEROFF_ART_CELL_H;
     const int y_offset = (SCREEN_H - art_height) / 2;
 
     display.setFullWindow();
@@ -275,11 +275,19 @@ void powerOff() {
                 row++;
                 col = 0;
             } else {
-                if (*p != ' ') {
-                    int px = col * POWEROFF_ART_PX_W;
-                    int py = y_offset + row * POWEROFF_ART_PX_H;
-                    if (px + POWEROFF_ART_PX_W <= SCREEN_W && py + POWEROFF_ART_PX_H <= SCREEN_H && py >= 0) {
-                        display.fillRect(px, py, POWEROFF_ART_PX_W, POWEROFF_ART_PX_H, GxEPD_BLACK);
+                const PoweroffGlyph& glyph = poweroffGlyphFor(*p);
+                int cell_x = col * POWEROFF_ART_CELL_W;
+                int cell_y = y_offset + row * POWEROFF_ART_CELL_H;
+
+                for (int gy = 0; gy < POWEROFF_ART_CELL_H; gy++) {
+                    uint8_t row_bits = glyph.rows[gy];
+                    for (int gx = 0; gx < POWEROFF_ART_CELL_W; gx++) {
+                        if ((row_bits & (1 << (POWEROFF_ART_CELL_W - 1 - gx))) == 0) continue;
+                        int px = cell_x + gx;
+                        int py = cell_y + gy;
+                        if (px < 0 || py < 0 || px >= SCREEN_W || py >= SCREEN_H) continue;
+                        if (!poweroffShadeAllowsPixel(glyph.shade, px, py)) continue;
+                        display.drawPixel(px, py, GxEPD_BLACK);
                     }
                 }
                 col++;
@@ -680,4 +688,3 @@ void renderCommandPrompt() {
         }
     } while (display.nextPage());
 }
-
