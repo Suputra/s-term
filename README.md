@@ -96,17 +96,26 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `dc` | Disconnect SSH |
 | `ws` / `scan` | Scan WiFi and retry known APs manually |
 | `f` / `refresh` | Force full e-ink refresh |
-| `4` / `4g` | Toggle 4G modem |
 | `s` / `status` | Show WiFi/SSH/VPN/battery status |
 | `?` / `h` / `help` | Show help |
 
-### 4G Modem
-
-**Alt+M** toggles the A7682E cellular modem (off by default). Currently supports AT commands and network registration. PPPoS for SSH-over-cellular is planned.
-
 ## Architecture
 
-Single-file firmware (`src/main.cpp`). Two FreeRTOS cores:
+Firmware entry point remains `src/main.cpp` (setup/loop and global state), while major firmware components are split into flat module headers in `src/`:
+
+- `src/network_module.hpp` (WiFi, SSH, VPN connectivity)
+- `src/screen_module.hpp` (display rendering/task logic)
+- `src/keyboard_module.hpp` (keyboard input + mode handlers)
+- `src/cli_module.hpp` (command parsing, SCP helpers, poweroff flow)
+
+Shared configuration/constants are split into:
+
+- `src/firmware/pins.h`
+- `src/firmware/layout.h`
+- `src/firmware/keyboard_map.h`
+- `src/firmware/network_config.h`
+
+Runtime uses two FreeRTOS cores:
 
 - **Core 0** — e-ink display rendering
 - **Core 1** — keyboard polling, WiFi/SSH/VPN, file I/O
