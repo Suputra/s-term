@@ -73,7 +73,7 @@ source scripts/setup-pio.sh
 
 ## SD Card Config
 
-Credentials are loaded from a `/CONFIG` file on the SD card (FAT32). Section-based format with `#` comments and blank lines ignored. Section headers are `# wifi`, `# ssh`, `# vpn`, `# bt`.
+Credentials are loaded from a `/CONFIG` file on the SD card (FAT32). Section-based format with `#` comments and blank lines ignored. Section headers are `# wifi`, `# ssh`, `# vpn`, `# bt`, `# time`.
 
 ```
 # wifi (SSID/password pairs; blank or missing password means open WiFi)
@@ -109,6 +109,9 @@ enable
 TDeck-Pro
 # optional 6-digit static passkey for secure pairing
 123456
+
+# time (optional, POSIX TZ string for local date/time display + daily files)
+PST8PDT,M3.2.0,M11.1.0
 ```
 
 Open WiFi entries: put only the SSID and leave the password line blank (or end the WiFi section right after the SSID).
@@ -120,6 +123,8 @@ Open WiFi entries: put only the SSID and leave the password line blank (or end t
 
 If `# bt` section is missing, BLE stays disabled.
 If BT is enabled, the device advertises as a generic BLE peripheral (not a keyboard), so phones keep their on-screen keyboard.
+
+If `# time` is missing, timezone defaults to `UTC0`.
 
 ## Usage
 
@@ -155,6 +160,7 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `e` / `edit [file]` | Edit a file (loads into notepad). With no filename, opens interactive picker (W/S move, A/D page, Enter open). |
 | `w` / `save` | Save notepad to current file |
 | `n` / `new` | New file (auto-saves current) |
+| `daily` / `day` / `today` | Open today’s file as `YYYY-MM-DD.md` (local timezone) |
 | `r` / `rm <file>` | Delete a file |
 | `u` / `upload` | SCP all SD files to `~/tdeck` on SSH host |
 | `d` / `download` | SCP `~/tdeck` files to SD card |
@@ -162,9 +168,16 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `dc` | Disconnect SSH |
 | `ws` / `scan` | Scan WiFi and retry known APs manually |
 | `bt` / `bluetooth` | Toggle Bluetooth on/off |
+| `gnss` / `gps` | GNSS status |
+| `gnsson` / `gpson` | Power GNSS on |
+| `gnssoff` / `gpsoff` | Power GNSS off |
+| `gnssraw` / `gpsraw` | Show latest raw RMC/GGA lines |
 | `f` / `refresh` | Force full e-ink refresh |
 | `s` / `status` | Show WiFi/SSH/VPN/battery status (includes BT name/pair/peer) |
 | `?` / `h` / `help` | Show help |
+
+GNSS stays off by default and is only active after `gpson` (or `gnsson`).
+When GNSS has valid UTC + fix, firmware auto-syncs system clock. NTP sync (VPN path) also updates the same clock.
 
 ## Architecture
 

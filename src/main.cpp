@@ -42,6 +42,7 @@ static char   config_vpn_ip[32]      = "";
 static char   config_vpn_endpoint[64] = "";
 static int    config_vpn_port        = 51820;
 static char   config_vpn_dns[32]     = "";
+static char   config_time_tz[64]     = "UTC0";
 static WireGuard wg;
 static bool   vpn_connected = false;
 static bool vpnConfigured() { return config_vpn_privkey[0] != '\0'; }
@@ -817,8 +818,9 @@ void sdLoadConfig() {
     // # wifi — pairs of ssid/password (variable count)
     // # ssh — host, port, user, pass, [optional vpn-host]
     // # vpn — ENABLE, privkey, pubkey, psk, ip, endpoint, port, [optional dns]
-    // # bt  — optional BLE settings ([optional enable], name, [optional 6-digit pin])
-    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT } section = SEC_WIFI;
+    // # bt   — optional BLE settings ([optional enable], name, [optional 6-digit pin])
+    // # time — optional timezone (POSIX TZ string), e.g. PST8PDT,M3.2.0,M11.1.0
+    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT, SEC_TIME } section = SEC_WIFI;
     int field = 0;  // field index within current section
     bool wifi_expect_ssid = true;
     char wifi_ssid[64] = "";
@@ -879,6 +881,9 @@ void sdLoadConfig() {
             else if (line.indexOf("vpn") >= 0) { section = SEC_VPN; field = 0; }
             else if (line.indexOf("bt") >= 0)  {
                 section = SEC_BT;
+                field = 0;
+            } else if (line.indexOf("time") >= 0) {
+                section = SEC_TIME;
                 field = 0;
             }
             continue;
@@ -982,16 +987,24 @@ void sdLoadConfig() {
                 continue;
             }
             field++;
+        } else if (section == SEC_TIME) {
+            if (field == 0) {
+                strncpy(config_time_tz, line.c_str(), sizeof(config_time_tz) - 1);
+                config_time_tz[sizeof(config_time_tz) - 1] = '\0';
+                Serial.printf("SD: timezone set: %s\n", config_time_tz);
+            }
+            field++;
         }
     }
     flushPendingOpenWiFi();
     f.close();
-    Serial.printf("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=%s, BT name=%s)\n",
+    Serial.printf("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=%s, BT name=%s, TZ=%s)\n",
                   config_wifi_count,
                   config_ssh_host,
                   vpnConfigured() ? "yes" : "no",
                   config_bt_enabled ? "on" : "off",
-                  config_bt_name);
+                  config_bt_name,
+                  config_time_tz);
 }
 
 // --- File I/O Helpers ---
@@ -1222,7 +1235,9 @@ void autoSaveDirty() {
     saveToFile(current_file.c_str());
 }
 
+#include "time_sync_module.hpp"
 #include "network_module.hpp"
+#include "gnss_module.hpp"
 #include "bluetooth_module.hpp"
 #include "screen_module.hpp"
 #include "keyboard_module.hpp"
@@ -1235,6 +1250,7 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("T-Deck Pro Notepad + Terminal starting...");
+    timeSyncInit();
 
     // Clear any GPIO deep-sleep holds from a prior power-off cycle.
     gpio_hold_dis((gpio_num_t)BOARD_LORA_EN);
@@ -1292,6 +1308,8 @@ void setup() {
     // Init SD card and load config (before display task to avoid SPI contention)
     sdInit();
     sdLoadConfig();
+    timeSyncSetTimeZone(config_time_tz);
+    gnssInit();
     btInit();
 
     // Init terminal buffer
@@ -1318,6 +1336,7 @@ void setup() {
 // Core 1: keyboard polling — never blocks on display
 void loop() {
     agentPollSerial();
+    gnssPoll();
 
     // Press BOOT to request power-off (same behavior as the "off" command).
     if (!poweroff_requested) {

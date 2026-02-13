@@ -22,5 +22,8 @@
 #define BOARD_LORA_EN       46
 #define BOARD_GPS_EN        39
 #define BOARD_1V8_EN        38
+#define BOARD_GPS_TXD       43
+#define BOARD_GPS_RXD       44
+#define BOARD_GPS_PPS       1
 
 #define BOARD_BOOT_PIN      0

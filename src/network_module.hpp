@@ -147,6 +147,7 @@ bool vpnConnect(bool force_reinit) {
         connectMsg("VPN: NTP failed");
         return false;
     }
+    timeSyncMarkNtp();
     connectMsg("VPN: connecting...");
     IPAddress local_ip;
     if (!local_ip.fromString(config_vpn_ip)) {
@@ -485,4 +486,3 @@ void sshReceiveTask(void* param) {
         }
     }
 }
-

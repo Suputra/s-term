@@ -715,6 +715,97 @@ void wifiScanCommand() {
     WiFi.scanDelete();
 }
 
+void gnssStatusCommand() {
+    GnssSnapshot snap;
+    gnssGetSnapshot(&snap);
+
+    cmdClearResult();
+    cmdAddLine("GNSS:%s fix:%s sats:%d",
+               snap.power_on ? "on" : "off",
+               snap.has_fix ? "yes" : "no",
+               snap.satellites);
+
+    if (snap.has_time) {
+        char utc[32];
+        if (gnssFormatUtc(&snap, utc, sizeof(utc))) {
+            cmdAddLine("UTC:%s", utc);
+        }
+    }
+
+    if (snap.has_location) {
+        cmdAddLine("Lat:%.5f", snap.latitude_deg);
+        cmdAddLine("Lon:%.5f", snap.longitude_deg);
+    }
+
+    if (snap.has_altitude || snap.has_hdop) {
+        char line[COLS_PER_LINE + 1];
+        line[0] = '\0';
+        if (snap.has_altitude && snap.has_hdop) {
+            snprintf(line, sizeof(line), "Alt:%.1fm HDOP:%.1f", snap.altitude_m, snap.hdop);
+        } else if (snap.has_altitude) {
+            snprintf(line, sizeof(line), "Alt:%.1fm", snap.altitude_m);
+        } else {
+            snprintf(line, sizeof(line), "HDOP:%.1f", snap.hdop);
+        }
+        cmdAddLine("%s", line);
+    }
+
+    if (snap.power_on && snap.last_rx_ms > 0) {
+        cmdAddLine("Rx age:%lums", (unsigned long)(millis() - snap.last_rx_ms));
+    } else if (snap.power_on) {
+        cmdAddLine("Rx age: n/a");
+    }
+
+    cmdAddLine("Clock:%s src:%s",
+               timeSyncClockLooksValid() ? "set" : "unset",
+               timeSyncSourceName(time_sync_source));
+    cmdAddLine("TZ:%s", timeSyncGetTimeZone());
+
+    cmdAddLine("NMEA:%lu CK:%lu PF:%lu",
+               (unsigned long)snap.total_sentences,
+               (unsigned long)snap.checksum_failures,
+               (unsigned long)snap.parse_failures);
+}
+
+void gnssRawCommand() {
+    GnssSnapshot snap;
+    gnssGetSnapshot(&snap);
+
+    cmdClearResult();
+    cmdAddLine("GNSS:%s raw", snap.power_on ? "on" : "off");
+    if (snap.last_rmc[0] != '\0') cmdAddLine("RMC:%s", snap.last_rmc);
+    if (snap.last_gga[0] != '\0') cmdAddLine("GGA:%s", snap.last_gga);
+    if (snap.last_rmc[0] == '\0' && snap.last_gga[0] == '\0') cmdAddLine("No NMEA yet");
+    cmdAddLine("USB serial has full lines");
+
+    if (snap.last_rmc[0] != '\0') Serial.printf("GNSS RMC %s\n", snap.last_rmc);
+    if (snap.last_gga[0] != '\0') Serial.printf("GNSS GGA %s\n", snap.last_gga);
+}
+
+void dailyOpenCommand() {
+    char name[20];
+    if (!timeSyncMakeDailyFilename(name, sizeof(name))) {
+        cmdSetResult("Clock unset; gpson/WiFi");
+        return;
+    }
+
+    autoSaveDirty();
+    String path = "/" + String(name);
+    if (loadFromFile(path.c_str())) {
+        current_file = path;
+        cmdSetResult("Daily %s (%d B)", name, text_len);
+    } else {
+        text_len = 0;
+        cursor_pos = 0;
+        scroll_line = 0;
+        text_buf[0] = '\0';
+        current_file = path;
+        file_modified = false;
+        cmdSetResult("Daily new %s", name);
+    }
+    app_mode = MODE_NOTEPAD;
+}
+
 void executeCommand(const char* cmd) {
     // Parse command word and argument
     char word[CMD_BUF_LEN + 1];
@@ -789,6 +880,8 @@ void executeCommand(const char* cmd) {
         file_modified = false;
         cmdSetResult("New buffer");
         app_mode = MODE_NOTEPAD;
+    } else if (strcmp(word, "daily") == 0 || strcmp(word, "day") == 0 || strcmp(word, "today") == 0) {
+        dailyOpenCommand();
     } else if (strcmp(word, "r") == 0 || strcmp(word, "rm") == 0) {
         if (arg[0] == '\0') { cmdSetResult("r <name>"); }
         else {
@@ -863,6 +956,16 @@ void executeCommand(const char* cmd) {
             btSetEnabled(next);
             cmdSetResult("BT %s (%s)", next ? "on" : "off", btStatusShort());
         }
+    } else if (strcmp(word, "gnss") == 0 || strcmp(word, "gps") == 0) {
+        gnssStatusCommand();
+    } else if (strcmp(word, "gnsson") == 0 || strcmp(word, "gpson") == 0) {
+        if (gnssSetPower(true)) cmdSetResult("GNSS on");
+        else cmdSetResult("GNSS already on");
+    } else if (strcmp(word, "gnssoff") == 0 || strcmp(word, "gpsoff") == 0) {
+        if (gnssSetPower(false)) cmdSetResult("GNSS off");
+        else cmdSetResult("GNSS already off");
+    } else if (strcmp(word, "gnssraw") == 0 || strcmp(word, "gpsraw") == 0) {
+        gnssRawCommand();
     } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
         const char* ws = "off";
         if (wifi_state == WIFI_CONNECTED) ws = "ok";
@@ -880,14 +983,19 @@ void executeCommand(const char* cmd) {
             cmdAddLine("BT peer:%s", btPeerAddress());
         }
         cmdAddLine("Bat:%d%% Heap:%dK", battery_pct, ESP.getFreeHeap() / 1024);
+        cmdAddLine("Clock:%s(%s)",
+                   timeSyncClockLooksValid() ? "set" : "unset",
+                   timeSyncSourceName(time_sync_source));
+        cmdAddLine("TZ:%s", timeSyncGetTimeZone());
         if (current_file.length() > 0) cmdAddLine("File:%s%s", current_file.c_str(), file_modified ? "*" : "");
     } else if (strcmp(word, "off") == 0) {
         poweroff_requested = true;
     } else if (strcmp(word, "?") == 0 || strcmp(word, "h") == 0 || strcmp(word, "help") == 0) {
         cmdClearResult();
         cmdAddLine("(l)ist (e)dit (w)rite (n)ew");
-        cmdAddLine("(r)m (u)pload (d)ownload");
+        cmdAddLine("daily (r)m (u)pload (d)ownload");
         cmdAddLine("(p)aste dc (ws)/scan bt(toggle)");
+        cmdAddLine("gps gpson gpsoff gpsraw");
         cmdAddLine("re(f)resh (s)tatus off (h)elp");
     } else {
         cmdSetResult("Unknown: %s (?=help)", word);
