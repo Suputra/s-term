@@ -940,6 +940,13 @@ void executeCommand(const char* cmd) {
             }
             cmdSetResult("Pasted %d chars", text_len);
         }
+    } else if (strcmp(word, "ssh") == 0) {
+        app_mode = MODE_TERMINAL;
+        if (!ssh_connected && !ssh_connecting) {
+            sshConnectAsync();
+        }
+    } else if (strcmp(word, "np") == 0 || strcmp(word, "note") == 0 || strcmp(word, "notepad") == 0) {
+        app_mode = MODE_NOTEPAD;
     } else if (strcmp(word, "dc") == 0) {
         sshDisconnect();
         cmdSetResult("Disconnected");
@@ -994,8 +1001,8 @@ void executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("(l)ist (e)dit (w)rite (n)ew");
         cmdAddLine("daily (r)m (u)pload (d)ownload");
-        cmdAddLine("(p)aste dc (ws)/scan bt(toggle)");
-        cmdAddLine("gps gpson gpsoff gpsraw");
+        cmdAddLine("(p)aste ssh (np)ad dc (ws)/scan");
+        cmdAddLine("bt(toggle) gps gpson gpsoff gpsraw");
         cmdAddLine("re(f)resh (s)tatus off (h)elp");
     } else {
         cmdSetResult("Unknown: %s (?=help)", word);

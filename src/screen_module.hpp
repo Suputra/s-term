@@ -110,9 +110,9 @@ void updateBattery() {
     }
 }
 
-// MIC double-tap detection
+// MIC tap timestamp (single tap opens command prompt after a short delay)
 static unsigned long mic_last_press = 0;
-#define MIC_DOUBLE_TAP_MS 350
+#define MIC_CMD_TAP_DELAY_MS 350
 
 void drawStatusBar(const LayoutInfo& info) {
     int bar_y = SCREEN_H - STATUS_H;

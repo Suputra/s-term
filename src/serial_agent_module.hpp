@@ -395,7 +395,7 @@ static void agentRunCommand(char* line) {
 
     if (strcasecmp(p, "MIC") == 0) {
         if (!arg || *arg == '\0') {
-            agentReplyErr("usage: @MIC SINGLE|DOUBLE");
+            agentReplyErr("usage: @MIC SINGLE");
             xSemaphoreGive(state_mutex);
             return;
         }
@@ -405,14 +405,7 @@ static void agentRunCommand(char* line) {
             xSemaphoreGive(state_mutex);
             return;
         }
-        if (strcasecmp(arg, "DOUBLE") == 0) {
-            agentPressKeyLocked(3, 6);
-            agentPressKeyLocked(3, 6);
-            agentReplyOk("MIC DOUBLE");
-            xSemaphoreGive(state_mutex);
-            return;
-        }
-        agentReplyErr("usage: @MIC SINGLE|DOUBLE");
+        agentReplyErr("usage: @MIC SINGLE");
         xSemaphoreGive(state_mutex);
         return;
     }

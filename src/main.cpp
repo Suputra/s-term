@@ -1329,7 +1329,7 @@ void setup() {
         0               // core 0
     );
 
-    Serial.println("Ready. Double-tap MIC toggles notepad/terminal. Single-tap MIC for commands.");
+    Serial.println("Ready. Single-tap MIC for commands. Use `ssh` to open terminal.");
     Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 }
 
@@ -1381,7 +1381,7 @@ void loop() {
     }
 
     // MIC single-tap timeout → open command processor
-    if (mic_last_press > 0 && (millis() - mic_last_press >= MIC_DOUBLE_TAP_MS)) {
+    if (mic_last_press > 0 && (millis() - mic_last_press >= MIC_CMD_TAP_DELAY_MS)) {
         mic_last_press = 0;
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         cmd_return_mode = app_mode;

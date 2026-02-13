@@ -88,7 +88,6 @@ Send one command per line with `@` prefix.
 - `@CHAR <char>`
 - `@TEXT <text-with-escapes>`
 - `@MIC SINGLE`
-- `@MIC DOUBLE`
 - `@CMD <device-command-mode-command>`
 - `@WAIT <ms>`
 - `@RENDER`
@@ -103,8 +102,8 @@ Escapes in `TEXT`/`CHAR`: `\\n`, `\\r`, `\\t`, `\\\\`, `\\s`.
 Quick keypress examples:
 ```bash
 uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"     # opens command mode
-uv run scripts/tdeck_agent.py "MIC DOUBLE" "WAIT 300" "STATE"     # toggles terminal/notepad
-uv run scripts/tdeck_agent.py "PRESS MIC 2" "WAIT 300" "STATE"    # double-tap via generic press
+uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"        # switches to terminal/SSH mode
+uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"         # returns to notepad mode
 ```
 
 ## Troubleshooting

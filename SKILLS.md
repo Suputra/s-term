@@ -60,7 +60,7 @@ Constraint:
 Use to emulate device input and mode transitions without touching hardware keys.
 
 Available primitives:
-- `MIC SINGLE` / `MIC DOUBLE`
+- `MIC SINGLE`
 - `KEY row col_rev`
 - `KEYNAME ...` (supports special names and single-char physical key tokens)
 - `PRESS token [count]`
@@ -78,8 +78,8 @@ uv run scripts/tdeck_agent.py "CMD new" "TEXT ls\\n" "RENDER" "WAIT 400" "STATE"
 Mode-control examples:
 ```bash
 uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"
-uv run scripts/tdeck_agent.py "MIC DOUBLE" "WAIT 300" "STATE"
-uv run scripts/tdeck_agent.py "PRESS MIC 2" "WAIT 300" "STATE"
+uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"
+uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"
 ```
 
 ## `visual-capture`

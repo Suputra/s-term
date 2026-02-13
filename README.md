@@ -37,7 +37,7 @@ With debug firmware flashed, you can drive the device over serial:
 uv sync
 uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"
 uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"
-uv run scripts/tdeck_agent.py "MIC DOUBLE" "WAIT 300" "STATE"
+uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"
 ```
 
 You can also capture screen evidence from the default IP camera feed (`http://10.0.44.199:4747/`):
@@ -138,7 +138,7 @@ Type on the keyboard. Text wraps to the e-ink display.
 
 ### Terminal
 
-Double-tap **MIC** to switch to terminal mode. The device connects WiFi, tries SSH directly, and if the host isn't reachable falls back through WireGuard VPN automatically. Double-tap **MIC** again to return to notepad.
+Run `ssh` from the command prompt to switch to terminal mode. The device connects WiFi, tries SSH directly, and if the host isn't reachable falls back through WireGuard VPN automatically. Run `np` (or `notepad`) from the command prompt to return to notepad.
 
 - **Alt** — acts as ctrl - alt + space -> esc
 
@@ -165,6 +165,8 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `u` / `upload` | SCP all SD files to `~/tdeck` on SSH host |
 | `d` / `download` | SCP `~/tdeck` files to SD card |
 | `p` / `paste` | Paste notepad to SSH |
+| `ssh` | Switch to terminal mode and start SSH connect if needed |
+| `np` / `note` / `notepad` | Switch to notepad mode without clearing the buffer |
 | `dc` | Disconnect SSH |
 | `ws` / `scan` | Scan WiFi and retry known APs manually |
 | `bt` / `bluetooth` | Toggle Bluetooth on/off |

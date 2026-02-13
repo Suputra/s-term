@@ -71,16 +71,7 @@ bool handleNotepadKeyPress(int event_code) {
             }
             return false;
         }
-        unsigned long now = millis();
-        if (now - mic_last_press < MIC_DOUBLE_TAP_MS) {
-            mic_last_press = 0;
-            app_mode = MODE_TERMINAL;
-            if (!ssh_connected && !ssh_connecting) {
-                sshConnectAsync();
-            }
-            return false;
-        }
-        mic_last_press = now;
+        mic_last_press = millis();
         return false;
     }
     if (IS_DEAD(row, col_rev))   { return false; }
@@ -158,13 +149,7 @@ bool handleTerminalKeyPress(int event_code) {
     if (IS_ALT(row, col_rev))    { alt_mode = !alt_mode; return true; }
     if (IS_MIC(row, col_rev))    {
         if (sym_mode) { sym_mode = false; sshSendKey('0'); return false; }
-        unsigned long now = millis();
-        if (now - mic_last_press < MIC_DOUBLE_TAP_MS) {
-            mic_last_press = 0;
-            app_mode = MODE_NOTEPAD;
-            return false;
-        }
-        mic_last_press = now;
+        mic_last_press = millis();
         return false;
     }
     if (IS_DEAD(row, col_rev))   { return false; }

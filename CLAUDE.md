@@ -37,7 +37,8 @@ Use a working index (`opened=1`, `frame=1`, non-zero mean/std) as `--camera-sour
 
 Keypress-driven examples:
 - Open command palette: `uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"`
-- Toggle terminal (SSH attempt path): `uv run scripts/tdeck_agent.py "MIC DOUBLE" "WAIT 300" "STATE"`
+- Open terminal (SSH attempt path): `uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"`
+- Return to notepad: `uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"`
 - Generic repeated press: `uv run scripts/tdeck_agent.py "PRESS MIC 2" "WAIT 300" "STATE"`
 
 ## Notes
