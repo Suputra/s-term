@@ -16,6 +16,7 @@
 
 static char agent_rx_buf[AGENT_RX_BUF_LEN];
 static int  agent_rx_len = 0;
+static constexpr uint32_t AGENT_STATE_LOCK_TIMEOUT_MS = 1000;
 
 static const char* agentModeName(AppMode mode) {
     switch (mode) {
@@ -212,6 +213,11 @@ static void agentReportStateLocked() {
     );
 }
 
+static bool agentTakeStateLock() {
+    if (!state_mutex) return false;
+    return xSemaphoreTake(state_mutex, pdMS_TO_TICKS(AGENT_STATE_LOCK_TIMEOUT_MS)) == pdTRUE;
+}
+
 static void agentRunCommand(char* line) {
     char* p = agentTrim(line);
     if (*p == '\0') {
@@ -256,7 +262,10 @@ static void agentRunCommand(char* line) {
         return;
     }
 
-    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    if (!agentTakeStateLock()) {
+        agentReplyErr("busy: state lock timeout");
+        return;
+    }
 
     if (strcasecmp(p, "MODE") == 0) {
         agentReplyOk("MODE %s", agentModeName(app_mode));
@@ -465,7 +474,12 @@ static void agentRunCommand(char* line) {
             return;
         }
         cmd_return_mode = app_mode;
+        xSemaphoreGive(state_mutex);
         executeCommand(arg);
+        if (!agentTakeStateLock()) {
+            agentReplyErr("busy: state lock timeout");
+            return;
+        }
         if (app_mode == MODE_NOTEPAD || app_mode == MODE_COMMAND) render_requested = true;
         else term_render_requested = true;
         agentReplyOk("CMD %s", arg);

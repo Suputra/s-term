@@ -1383,22 +1383,25 @@ void loop() {
     // MIC single-tap timeout → open command processor
     if (mic_last_press > 0 && (millis() - mic_last_press >= MIC_CMD_TAP_DELAY_MS)) {
         mic_last_press = 0;
-        xSemaphoreTake(state_mutex, portMAX_DELAY);
-        cmd_return_mode = app_mode;
-        cmd_len = 0;
-        cmd_buf[0] = '\0';
-        cmd_result_valid = false;
-        cmdEditPickerStop();
-        app_mode = MODE_COMMAND;
-        xSemaphoreGive(state_mutex);
-        render_requested = true;
+        if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(25)) == pdTRUE) {
+            cmd_return_mode = app_mode;
+            cmd_len = 0;
+            cmd_buf[0] = '\0';
+            cmd_result_valid = false;
+            cmdEditPickerStop();
+            app_mode = MODE_COMMAND;
+            xSemaphoreGive(state_mutex);
+            render_requested = true;
+        }
     }
 
     while (keypad.available() > 0) {
         int ev = keypad.getEvent();
         if (!(ev & 0x80)) continue;  // skip release events
 
-        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(25)) != pdTRUE) {
+            continue;
+        }
         bool needs_render = false;
         AppMode mode = app_mode;
         if (mode == MODE_NOTEPAD) {

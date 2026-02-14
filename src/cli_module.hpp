@@ -113,6 +113,29 @@ bool sshReadLine(ssh_channel channel, char* out, size_t out_len) {
     }
 }
 
+bool sshReadLineWithTimeout(ssh_channel channel, char* out, size_t out_len, uint32_t timeout_ms) {
+    if (!out || out_len < 2) return false;
+    size_t pos = 0;
+    uint32_t start_ms = millis();
+    while ((uint32_t)(millis() - start_ms) < timeout_ms) {
+        char c = 0;
+        int n = ssh_channel_read_nonblocking(channel, &c, 1, 0);
+        if (n > 0) {
+            if (c == '\r') continue;
+            if (c == '\n') {
+                out[pos] = '\0';
+                return true;
+            }
+            if (pos + 1 >= out_len) return false;
+            out[pos++] = c;
+            continue;
+        }
+        if (n == SSH_ERROR || ssh_channel_is_eof(channel)) return false;
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return false;
+}
+
 bool sshOpenExecChannel(const char* command, ssh_channel* out_channel) {
     if (!ssh_connected || !ssh_sess || !command || !out_channel) return false;
     ssh_channel channel = ssh_channel_new(ssh_sess);
@@ -650,12 +673,34 @@ bool runShortcutRemoteCommand(const char* remote_cmd) {
     }
     if (!ensureSshForTransfer("Remote")) return false;
 
+    bool paused_recv = false;
+    if (ssh_recv_task_handle) {
+        vTaskDelete(ssh_recv_task_handle);
+        ssh_recv_task_handle = NULL;
+        paused_recv = true;
+    }
+    auto resumeRecvTask = [&]() {
+        if (!paused_recv) return;
+        if (!ssh_recv_task_handle && ssh_connected && ssh_chan) {
+            xTaskCreatePinnedToCore(
+                sshReceiveTask,
+                "ssh_recv",
+                16384,
+                NULL,
+                1,
+                &ssh_recv_task_handle,
+                0
+            );
+        }
+    };
+
     ssh_channel channel = NULL;
     if (!sshOpenExecChannel("/bin/sh -s", &channel)) {
         // Recover from stale/broken SSH sessions (common after long transfers).
         sshDisconnect();
         if (!ensureSshForTransfer("Remote retry") || !sshOpenExecChannel("/bin/sh -s", &channel)) {
             cmdSetResult("Remote start failed: %s", ssh_get_error(ssh_sess));
+            resumeRecvTask();
             return false;
         }
     }
@@ -672,20 +717,37 @@ bool runShortcutRemoteCommand(const char* remote_cmd) {
     if (script_len <= 0 || script_len >= (int)sizeof(script)) {
         sshCloseExecChannel(channel);
         cmdSetResult("Remote cmd too long");
+        resumeRecvTask();
         return false;
     }
     if (!sshWriteAll(channel, (const uint8_t*)script, (size_t)script_len)) {
         sshCloseExecChannel(channel);
         cmdSetResult("Remote write failed");
+        resumeRecvTask();
         return false;
     }
     ssh_channel_send_eof(channel);
 
     bool got_marker = false;
     int remote_rc = -1;
-    for (int i = 0; i < 32; i++) {
+    bool timed_out = false;
+    const uint32_t read_start_ms = millis();
+    int line_reads = 0;
+    while (line_reads < 64) {
+        uint32_t elapsed = (uint32_t)(millis() - read_start_ms);
+        if (elapsed >= TRANSFER_SSH_WAIT_MS) {
+            timed_out = true;
+            break;
+        }
+        uint32_t budget = TRANSFER_SSH_WAIT_MS - elapsed;
+        uint32_t slice_ms = (budget > 2000U) ? 2000U : budget;
+
         char line[TRANSFER_LINE_MAX];
-        if (!sshReadLine(channel, line, sizeof(line))) break;
+        if (!sshReadLineWithTimeout(channel, line, sizeof(line), slice_ms)) {
+            if (ssh_channel_is_eof(channel)) break;
+            continue;
+        }
+        line_reads++;
         if (strncmp(line, "__TDECK_RC__", 11) == 0) {
             remote_rc = atoi(line + 11);
             got_marker = true;
@@ -693,28 +755,39 @@ bool runShortcutRemoteCommand(const char* remote_cmd) {
         }
     }
     int exit_status = sshCloseExecChannel(channel);
+    if (timed_out) {
+        cmdSetResult("Remote timeout");
+        resumeRecvTask();
+        return false;
+    }
     if (!got_marker) {
         if (exit_status == 0) {
             cmdSetResult("Remote OK");
+            resumeRecvTask();
             return true;
         }
         if (exit_status > 0) {
             cmdSetResult("Remote failed (%d)", exit_status);
+            resumeRecvTask();
             return false;
         }
         cmdSetResult("Remote no status");
+        resumeRecvTask();
         return false;
     }
     if (remote_rc != 0) {
         cmdSetResult("Remote failed (%d)", remote_rc);
+        resumeRecvTask();
         return false;
     }
     if (exit_status != 0) {
         cmdSetResult("Remote shell failed (%d)", exit_status);
+        resumeRecvTask();
         return false;
     }
 
     cmdSetResult("Remote OK");
+    resumeRecvTask();
     return true;
 }
 
@@ -1518,9 +1591,14 @@ bool handleCommandKeyPress(int event_code) {
     }
 
     if (c == '\n') {
-        executeCommand(cmd_buf);
+        char command[CMD_BUF_LEN + 1];
+        strncpy(command, cmd_buf, sizeof(command) - 1);
+        command[sizeof(command) - 1] = '\0';
         cmd_len = 0;
         cmd_buf[0] = '\0';
+        xSemaphoreGive(state_mutex);
+        executeCommand(command);
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
         return true;
     }
 

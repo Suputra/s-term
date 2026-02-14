@@ -187,16 +187,37 @@ When GNSS has valid UTC + fix, firmware auto-syncs system clock. NTP sync (VPN p
 Shortcut scripts are plain text files on SD root with extension `.x`.
 You can edit them with `edit <name>.x`, and run them by typing `<name>` (or `<name>.x`) in the command prompt.
 
+How name resolution works:
+
+- Typing `deploy` runs `/deploy.x`
+- Typing `deploy.x` runs `/deploy.x`
+- Names must be SD-safe (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`)
+- Only one shortcut runs at a time
+
+Parsing and execution behavior:
+
+- Blank lines and lines starting with `#` are ignored
+- Max `24` executable lines per file
+- Max line length is `159` chars (longer lines fail parse)
+- Steps execute in order and stop on first failure
+- Status/progress appears in command result area (`Run <name> <i>/<n>`, then `Shortcut done: <name>`)
+
 Supported steps (one per line):
 
-- `upload` / `u` - start upload task
-- `download` / `d` - start download task
-- `wait upload` or `wait download` - wait for transfer completion
-- `wait <ms>` - delay in milliseconds
-- `remote <command>` (or `exec <command>`) - run an SSH exec command on remote host, require exit code `0`
-- `cmd <command>` - run an existing command-palette command
+- `upload` / `u`: start upload task (same as command-palette `upload`)
+- `download` / `d`: start download task (same as command-palette `download`)
+- `wait upload` / `wait download`: wait for transfer completion (5 min timeout)
+- `wait <ms>`: sleep/delay for milliseconds
+- `remote <command>` / `exec <command>`: run `<command>` on remote via SSH (`/bin/sh -s`), require remote exit code `0`
+- `cmd <command>`: run any existing command-palette command (for example `cmd daily`, `cmd ssh`, `cmd np`)
+- `<any command-palette command>`: bare command lines are also executed directly (`daily`, `new`, `status`, etc.)
 
-Blank lines and `#` comments are ignored.
+Remote-step notes:
+
+- If SSH is not connected, shortcut runtime will try to connect first
+- SSH connect wait window is up to ~45s per remote step
+- Non-zero remote exit fails the shortcut and surfaces `Remote failed (<code>)`
+- If the remote step cannot produce status within the timeout window, it fails as `Remote timeout`
 
 Example `deploy.x`:
 
@@ -206,6 +227,17 @@ upload
 wait upload
 remote mkdir -p "$HOME/app/config"
 remote cp -f "$HOME/tdeck/"*.json "$HOME/app/config/"
+```
+
+Example `daily-sync.x`:
+
+```text
+# Open today's note, save, upload, and switch back to notepad
+daily
+save
+upload
+wait upload
+np
 ```
 
 ## Architecture
