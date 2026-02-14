@@ -174,6 +174,20 @@ bool handleTerminalKeyPress(int event_code) {
         if (base >= 'a' && base <= 'z') {
             sshSendKey(base - 'a' + 1);
             alt_mode = false;
+            if (base == 'c') {
+                unsigned long now = millis();
+                if (terminal_last_ctrl_c_ms > 0 && (now - terminal_last_ctrl_c_ms) <= 1500) {
+                    terminal_last_ctrl_c_ms = 0;
+                    terminalClear();
+                    connect_status_count = 0;
+                    partial_count = 100;
+                    term_render_requested = true;
+                } else {
+                    terminal_last_ctrl_c_ms = now;
+                }
+            } else {
+                terminal_last_ctrl_c_ms = 0;
+            }
             return false;
         }
         return false;

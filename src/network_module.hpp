@@ -501,6 +501,14 @@ void sshReceiveTask(void* param) {
         } else if (nbytes == SSH_ERROR || ssh_channel_is_eof(ssh_chan)) {
             Serial.println("SSH: channel closed by remote");
             ssh_connected = false;
+
+            // Reset parser/buffer immediately so stale TUI content does not linger.
+            xSemaphoreTake(state_mutex, portMAX_DELAY);
+            terminalClear();
+            xSemaphoreGive(state_mutex);
+
+            connect_status_count = 0;
+            partial_count = 100;  // force a full clean redraw on next terminal render
             term_render_requested = true;
             vTaskDelay(pdMS_TO_TICKS(1000));
         } else {

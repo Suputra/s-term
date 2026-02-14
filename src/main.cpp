@@ -19,6 +19,10 @@
 #include "firmware/keyboard_map.h"
 #include "firmware/network_config.h"
 
+#ifndef TDECK_AGENT_DEBUG
+#define TDECK_AGENT_DEBUG 0
+#endif
+
 // --- WiFi / SSH Config (loaded from SD /CONFIG) ---
 
 static WiFiAP config_wifi[MAX_WIFI_APS];
@@ -107,6 +111,7 @@ static bool shift_held  = false;
 static bool sym_mode    = false;
 static bool alt_mode    = false;   // Ctrl modifier in terminal, unused in notepad
 static bool nav_mode    = false;   // WASD arrow keys (right shift toggle)
+static unsigned long terminal_last_ctrl_c_ms = 0;
 
 // Display task snapshot — private to core 0
 static char snap_buf[MAX_TEXT_LEN + 1];
@@ -160,10 +165,92 @@ static int saved_cursor_row = 0, saved_cursor_col = 0;
 // Cursor visibility
 static bool cursor_visible = true;
 static bool term_snap_cursor_visible = true;
+static bool term_wrap_pending = false; // delayed wrap after writing at last column
 
 // UTF-8 parsing state
 static int utf8_remaining = 0;
 static uint32_t utf8_codepoint = 0;
+
+#if TDECK_AGENT_DEBUG
+// Debug trace ring for SSH terminal parser input.
+#define TERM_TRACE_CAP 4096
+static uint8_t term_trace_buf[TERM_TRACE_CAP];
+static uint16_t term_trace_head = 0;
+static uint16_t term_trace_count = 0;
+static uint32_t term_trace_total = 0;
+static bool term_trace_enabled = false;
+
+void terminalDebugTraceSet(bool enabled) {
+    term_trace_enabled = enabled;
+}
+
+bool terminalDebugTraceEnabled() {
+    return term_trace_enabled;
+}
+
+void terminalDebugTraceClear() {
+    term_trace_head = 0;
+    term_trace_count = 0;
+    term_trace_total = 0;
+}
+
+void terminalDebugTraceRecord(uint8_t b) {
+    if (!term_trace_enabled) return;
+    term_trace_buf[term_trace_head] = b;
+    term_trace_head = (uint16_t)((term_trace_head + 1) % TERM_TRACE_CAP);
+    if (term_trace_count < TERM_TRACE_CAP) term_trace_count++;
+    term_trace_total++;
+}
+
+void terminalDebugTraceDump(int max_bytes) {
+    if (max_bytes <= 0 || max_bytes > TERM_TRACE_CAP) max_bytes = TERM_TRACE_CAP;
+    int n = term_trace_count;
+    if (n > max_bytes) n = max_bytes;
+    int dropped = (int)term_trace_total - term_trace_count;
+
+    Serial.printf("AGENT OK TRACE enabled=%d bytes=%d total=%lu dropped=%d\n",
+                  term_trace_enabled ? 1 : 0, n, (unsigned long)term_trace_total, dropped);
+    if (n <= 0) return;
+
+    int start = term_trace_head - n;
+    if (start < 0) start += TERM_TRACE_CAP;
+
+    for (int i = 0; i < n; i += 16) {
+        int chunk = (n - i > 16) ? 16 : (n - i);
+        int idx = (start + i) % TERM_TRACE_CAP;
+        Serial.printf("TRACEHEX %04d:", i);
+        for (int j = 0; j < chunk; j++) {
+            int pos = (idx + j) % TERM_TRACE_CAP;
+            Serial.printf(" %02X", term_trace_buf[pos]);
+        }
+        Serial.print(" |");
+        for (int j = 0; j < chunk; j++) {
+            int pos = (idx + j) % TERM_TRACE_CAP;
+            uint8_t c = term_trace_buf[pos];
+            Serial.print((c >= 32 && c <= 126) ? (char)c : '.');
+        }
+        Serial.println("|");
+    }
+}
+
+void terminalDebugStateDump() {
+    Serial.printf(
+        "AGENT OK TERMDBG row=%d col=%d scroll=%d lines=%d wrap=%d esc=%d csi=%d priv=%d utf8_rem=%d utf8_cp=%lu alt=%d sr_top=%d sr_bot=%d sr_set=%d\n",
+        term_cursor_row, term_cursor_col, term_scroll, term_line_count,
+        term_wrap_pending ? 1 : 0,
+        in_escape ? 1 : 0, in_bracket ? 1 : 0, csi_private ? 1 : 0,
+        utf8_remaining, (unsigned long)utf8_codepoint,
+        term_alt_active ? 1 : 0, scroll_region_top, scroll_region_bot, scroll_region_set ? 1 : 0
+    );
+}
+#else
+void terminalDebugTraceSet(bool enabled) { (void)enabled; }
+bool terminalDebugTraceEnabled() { return false; }
+void terminalDebugTraceClear() {}
+void terminalDebugTraceRecord(uint8_t b) { (void)b; }
+void terminalDebugTraceDump(int max_bytes) { (void)max_bytes; }
+void terminalDebugStateDump() {}
+#endif
 
 // --- SSH State ---
 
@@ -234,6 +321,7 @@ void terminalClear() {
     scroll_region_set = false;
     term_alt_active = false;
     cursor_visible = true;
+    term_wrap_pending = false;
     utf8_remaining = 0;
     utf8_codepoint = 0;
     saved_cursor_row = 0;
@@ -310,6 +398,7 @@ void enterAltScreen() {
     term_cursor_col = 0;
     term_line_count = 1;
     term_scroll = 0;
+    term_wrap_pending = false;
     scroll_region_top = 0;
     scroll_region_bot = ROWS_PER_SCREEN - 1;
     scroll_region_set = false;
@@ -325,6 +414,7 @@ void leaveAltScreen() {
     term_cursor_col = saved_main_cursor_col;
     term_line_count = saved_main_line_count;
     term_scroll = saved_main_scroll;
+    term_wrap_pending = false;
     scroll_region_top = 0;
     scroll_region_bot = ROWS_PER_SCREEN - 1;
     scroll_region_set = false;
@@ -335,6 +425,9 @@ void handleCSI(char final_char) {
     int p0 = (csi_param_count > 0) ? csi_params[0] : 0;
     int p1 = (csi_param_count > 1) ? csi_params[1] : 0;
     int max_row = term_alt_active ? ROWS_PER_SCREEN : TERM_ROWS;
+
+    // Formatting-only CSI (SGR) should not consume delayed-wrap state.
+    if (final_char != 'm') term_wrap_pending = false;
 
     // Handle private mode sequences (CSI ? ...)
     if (csi_private) {
@@ -577,17 +670,24 @@ void terminalCursorDown() {
 }
 
 void terminalPutChar(char ch) {
-    term_buf[term_cursor_row][term_cursor_col] = ch;
-    term_cursor_col++;
-    if (term_cursor_col >= TERM_COLS) {
+    if (term_wrap_pending) {
         term_cursor_col = 0;
         terminalCursorDown();
+        term_wrap_pending = false;
+    }
+
+    term_buf[term_cursor_row][term_cursor_col] = ch;
+    if (term_cursor_col >= TERM_COLS - 1) {
+        term_wrap_pending = true;
+    } else {
+        term_cursor_col++;
     }
 }
 
 void terminalAppendOutput(const char* data, int len) {
     for (int i = 0; i < len; i++) {
         unsigned char c = (unsigned char)data[i];
+        terminalDebugTraceRecord(c);
 
         // UTF-8 multi-byte sequence continuation
         if (utf8_remaining > 0) {
@@ -636,6 +736,7 @@ void terminalAppendOutput(const char* data, int len) {
                 in_escape = false;
                 switch (c) {
                     case 'M': // Reverse Index — cursor up, scroll region down if at top
+                        term_wrap_pending = false;
                         if (term_cursor_row == scroll_region_top) {
                             terminalScrollRegionDown(scroll_region_top, scroll_region_bot);
                         } else if (term_cursor_row > 0) {
@@ -643,6 +744,7 @@ void terminalAppendOutput(const char* data, int len) {
                         }
                         break;
                     case 'D': // Index — cursor down, scroll region up if at bottom
+                        term_wrap_pending = false;
                         if (term_cursor_row == scroll_region_bot) {
                             terminalScrollRegionUp(scroll_region_top, scroll_region_bot);
                         } else {
@@ -650,6 +752,7 @@ void terminalAppendOutput(const char* data, int len) {
                         }
                         break;
                     case 'E': // Next Line — cursor to start of next line
+                        term_wrap_pending = false;
                         term_cursor_col = 0;
                         terminalCursorDown();
                         break;
@@ -658,10 +761,12 @@ void terminalAppendOutput(const char* data, int len) {
                         saved_cursor_col = term_cursor_col;
                         break;
                     case '8': // Restore cursor
+                        term_wrap_pending = false;
                         term_cursor_row = saved_cursor_row;
                         term_cursor_col = saved_cursor_col;
                         break;
                     case 'c': // Full reset
+                        term_wrap_pending = false;
                         terminalClear();
                         break;
                     case '(': case ')': case '*': case '+':
@@ -742,17 +847,20 @@ void terminalAppendOutput(const char* data, int len) {
         }
 
         if (c == '\n') {
+            term_wrap_pending = false;
             term_cursor_col = 0;
             terminalCursorDown();
             continue;
         }
 
         if (c == '\r') {
+            term_wrap_pending = false;
             term_cursor_col = 0;
             continue;
         }
 
         if (c == '\b' || c == 0x7F) {
+            if (term_wrap_pending) term_wrap_pending = false;
             if (term_cursor_col > 0) {
                 term_cursor_col--;
                 term_buf[term_cursor_row][term_cursor_col] = ' ';
@@ -761,6 +869,7 @@ void terminalAppendOutput(const char* data, int len) {
         }
 
         if (c == '\t') {
+            if (term_wrap_pending) term_wrap_pending = false;
             int next_tab = (term_cursor_col + 8) & ~7;
             if (next_tab > TERM_COLS) next_tab = TERM_COLS;
             while (term_cursor_col < next_tab) {

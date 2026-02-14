@@ -237,7 +237,54 @@ static void agentRunCommand(char* line) {
         return;
     }
     if (strcasecmp(p, "HELP") == 0) {
-        agentReplyOk("commands=PING HELP STATE RESULT KEY PRESS TEXT CMD WAIT RENDER BOOTOFF");
+        agentReplyOk("commands=PING HELP STATE RESULT TRACE TERMDBG TERMSNAP TERMHEX TERMRANGE KEY PRESS TEXT CMD WAIT RENDER BOOTOFF");
+        return;
+    }
+
+    if (strcasecmp(p, "TRACE") == 0) {
+        if (!arg || *arg == '\0') {
+            agentReplyOk("TRACE enabled=%d", terminalDebugTraceEnabled() ? 1 : 0);
+            return;
+        }
+        if (strcasecmp(arg, "ON") == 0) {
+            terminalDebugTraceClear();
+            terminalDebugTraceSet(true);
+            agentReplyOk("TRACE ON");
+            return;
+        }
+        if (strcasecmp(arg, "OFF") == 0) {
+            terminalDebugTraceSet(false);
+            agentReplyOk("TRACE OFF");
+            return;
+        }
+        if (strcasecmp(arg, "CLEAR") == 0) {
+            terminalDebugTraceClear();
+            agentReplyOk("TRACE CLEAR");
+            return;
+        }
+        if (strncasecmp(arg, "DUMP", 4) == 0) {
+            int max_bytes = 512;
+            char* rest = agentTrim(arg + 4);
+            if (rest && *rest != '\0') {
+                char* end = NULL;
+                long parsed = strtol(rest, &end, 10);
+                end = agentTrim(end);
+                if (end == rest || (end && *end != '\0') || parsed <= 0) {
+                    agentReplyErr("usage: @TRACE DUMP [max_bytes]");
+                    return;
+                }
+                if (parsed > 4096) parsed = 4096;
+                max_bytes = (int)parsed;
+            }
+            terminalDebugTraceDump(max_bytes);
+            return;
+        }
+        agentReplyErr("usage: @TRACE [ON|OFF|CLEAR|DUMP [max_bytes]]");
+        return;
+    }
+
+    if (strcasecmp(p, "TERMDBG") == 0) {
+        terminalDebugStateDump();
         return;
     }
 
@@ -269,6 +316,101 @@ static void agentRunCommand(char* line) {
 
     if (strcasecmp(p, "STATE") == 0) {
         agentReportStateLocked();
+        xSemaphoreGive(state_mutex);
+        return;
+    }
+
+    if (strcasecmp(p, "TERMSNAP") == 0) {
+        int row_offset = 0;
+        if (arg && *arg != '\0') {
+            char* end = NULL;
+            long parsed = strtol(arg, &end, 10);
+            end = agentTrim(end);
+            if (end == arg || (end && *end != '\0') || parsed < 0) {
+                agentReplyErr("usage: @TERMSNAP [row]");
+                xSemaphoreGive(state_mutex);
+                return;
+            }
+            if (parsed >= ROWS_PER_SCREEN) parsed = ROWS_PER_SCREEN - 1;
+            row_offset = (int)parsed;
+        }
+
+        int row = term_scroll + row_offset;
+        if (row < 0) row = 0;
+        if (row >= TERM_ROWS) row = TERM_ROWS - 1;
+
+        char line[TERM_COLS + 1];
+        memcpy(line, term_buf[row], TERM_COLS);
+        line[TERM_COLS] = '\0';
+        int end = TERM_COLS;
+        while (end > 0 && line[end - 1] == ' ') end--;
+        line[end] = '\0';
+
+        agentReplyOk("TERMSNAP row=%d %s", row_offset, line);
+        xSemaphoreGive(state_mutex);
+        return;
+    }
+
+    if (strcasecmp(p, "TERMHEX") == 0) {
+        int row_offset = 0;
+        if (arg && *arg != '\0') {
+            char* end = NULL;
+            long parsed = strtol(arg, &end, 10);
+            end = agentTrim(end);
+            if (end == arg || (end && *end != '\0') || parsed < 0) {
+                agentReplyErr("usage: @TERMHEX [row]");
+                xSemaphoreGive(state_mutex);
+                return;
+            }
+            if (parsed >= ROWS_PER_SCREEN) parsed = ROWS_PER_SCREEN - 1;
+            row_offset = (int)parsed;
+        }
+        int row = term_scroll + row_offset;
+        if (row < 0) row = 0;
+        if (row >= TERM_ROWS) row = TERM_ROWS - 1;
+
+        char hex[TERM_COLS * 3 + 1];
+        int pos = 0;
+        for (int i = 0; i < TERM_COLS; i++) {
+            pos += snprintf(&hex[pos], sizeof(hex) - pos, "%02X", (unsigned char)term_buf[row][i]);
+            if (i + 1 < TERM_COLS && pos < (int)sizeof(hex) - 1) hex[pos++] = ' ';
+            if (pos >= (int)sizeof(hex) - 1) break;
+        }
+        hex[pos] = '\0';
+        agentReplyOk("TERMHEX row=%d %s", row_offset, hex);
+        xSemaphoreGive(state_mutex);
+        return;
+    }
+
+    if (strcasecmp(p, "TERMRANGE") == 0) {
+        int rows = 8;
+        if (arg && *arg != '\0') {
+            char* end = NULL;
+            long parsed = strtol(arg, &end, 10);
+            end = agentTrim(end);
+            if (end == arg || (end && *end != '\0') || parsed <= 0) {
+                agentReplyErr("usage: @TERMRANGE [rows]");
+                xSemaphoreGive(state_mutex);
+                return;
+            }
+            if (parsed > ROWS_PER_SCREEN) parsed = ROWS_PER_SCREEN;
+            rows = (int)parsed;
+        }
+        int first = term_scroll;
+        if (first < 0) first = 0;
+        agentReplyOk("TERMRANGE rows=%d start=%d", rows, first);
+        for (int i = 0; i < rows; i++) {
+            int row = first + i;
+            if (row < 0 || row >= TERM_ROWS) break;
+            char line[TERM_COLS + 1];
+            memcpy(line, term_buf[row], TERM_COLS);
+            line[TERM_COLS] = '\0';
+            int end = TERM_COLS;
+            while (end > 0 && line[end - 1] == ' ') end--;
+            line[end] = '\0';
+            Serial.printf("TERMRANGE %02d %s\n", i, line);
+        }
+        Serial.println("TERMRANGE END");
         xSemaphoreGive(state_mutex);
         return;
     }

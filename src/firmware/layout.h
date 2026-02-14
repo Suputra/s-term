@@ -3,8 +3,8 @@
 #define MAX_TEXT_LEN    4096
 #define CHAR_W          6
 #define CHAR_H          8
-#define MARGIN_X        2
-#define MARGIN_Y        2
+#define MARGIN_X        0
+#define MARGIN_Y        0
 #define SCREEN_W        240
 #define SCREEN_H        320
 #define STATUS_H        10
