@@ -6,10 +6,13 @@
 #include <BLEUtils.h>
 #include <esp_gap_ble_api.h>
 #include <cstring>
+#include <string>
 
 #define BT_PASSKEY_MIN           100000U
 #define BT_PASSKEY_MAX           999999U
 #define BT_ADV_TIMEOUT_MS        45000U
+#define BT_SCAN_DURATION_S       4U
+#define BT_SCAN_MAX_RESULTS      12
 
 #define BT_SERVICE_UUID          "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define BT_STATUS_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a8"
@@ -28,6 +31,22 @@ static BLEService* bt_service = NULL;
 static BLECharacteristic* bt_status_char = NULL;
 
 static char bt_peer_addr[18] = "";
+
+struct BtScanEntry {
+    char addr[18];
+    char name[32];
+    int rssi;
+    bool has_name;
+};
+
+static volatile bool bt_scan_running = false;
+static volatile bool bt_scan_done = false;
+static volatile bool bt_scan_ok = false;
+static bool bt_scan_restore_disabled = false;
+static bool bt_scan_resume_adv = false;
+static int bt_scan_total_found = 0;
+static int bt_scan_count = 0;
+static BtScanEntry bt_scan_results[BT_SCAN_MAX_RESULTS];
 
 static void btFormatAddr(const uint8_t* addr, char* out, size_t out_len) {
     if (!out || out_len == 0) return;
@@ -256,6 +275,18 @@ void btInit() {
 }
 
 void btShutdown() {
+    if (bt_scan_running) {
+        BLEScan* scanner = BLEDevice::getScan();
+        if (scanner) scanner->stop();
+    }
+    bt_scan_running = false;
+    bt_scan_done = false;
+    bt_scan_ok = false;
+    bt_scan_total_found = 0;
+    bt_scan_count = 0;
+    bt_scan_resume_adv = false;
+    bt_scan_restore_disabled = false;
+
     if (bt_connected && bt_server) {
         bt_server->disconnect(bt_server->getConnId());
     }
@@ -309,4 +340,137 @@ void btPoll() {
             SERIAL_LOGLN("BT: advertising timeout -> idle");
         }
     }
+}
+
+static void btScanCompleteCallback(BLEScanResults results) {
+    bt_scan_total_found = results.getCount();
+    bt_scan_count = 0;
+    int limit = bt_scan_total_found;
+    if (limit > BT_SCAN_MAX_RESULTS) limit = BT_SCAN_MAX_RESULTS;
+
+    for (int i = 0; i < limit; i++) {
+        BLEAdvertisedDevice dev = results.getDevice(i);
+        BtScanEntry* dst = &bt_scan_results[i];
+        memset(dst, 0, sizeof(*dst));
+        dst->rssi = dev.getRSSI();
+
+        std::string addr = dev.getAddress().toString();
+        snprintf(dst->addr, sizeof(dst->addr), "%s", addr.c_str());
+
+        if (dev.haveName()) {
+            std::string name = dev.getName();
+            snprintf(dst->name, sizeof(dst->name), "%s", name.c_str());
+            dst->has_name = (dst->name[0] != '\0');
+        } else {
+            dst->has_name = false;
+        }
+        bt_scan_count++;
+    }
+
+    BLEScan* scanner = BLEDevice::getScan();
+    if (scanner) scanner->clearResults();
+
+    bt_scan_ok = true;
+    bt_scan_done = true;
+    bt_scan_running = false;
+}
+
+bool btScanStartAsync() {
+    if (bt_scan_running) return false;
+    if (bt_connected) return false;
+
+    bt_scan_done = false;
+    bt_scan_ok = false;
+    bt_scan_total_found = 0;
+    bt_scan_count = 0;
+    bt_scan_resume_adv = false;
+    bt_scan_restore_disabled = false;
+    for (int i = 0; i < BT_SCAN_MAX_RESULTS; i++) {
+        bt_scan_results[i].addr[0] = '\0';
+        bt_scan_results[i].name[0] = '\0';
+        bt_scan_results[i].rssi = 0;
+        bt_scan_results[i].has_name = false;
+    }
+
+    if (!config_bt_enabled) {
+        btSetEnabled(true);
+        bt_scan_restore_disabled = true;
+        delay(20);
+    } else if (!bt_initialized) {
+        btInit();
+    }
+
+    if (!bt_initialized) {
+        if (bt_scan_restore_disabled) btSetEnabled(false);
+        bt_scan_restore_disabled = false;
+        return false;
+    }
+
+    bt_scan_resume_adv = bt_advertising;
+    if (bt_scan_resume_adv) {
+        BLEDevice::stopAdvertising();
+        bt_advertising = false;
+        bt_state = BT_STATE_OFF;
+        btSetStatusValue("idle");
+    }
+
+    BLEScan* scanner = BLEDevice::getScan();
+    if (!scanner) {
+        if (bt_scan_resume_adv && config_bt_enabled && !bt_connected) btStartAdvertising();
+        if (bt_scan_restore_disabled) btSetEnabled(false);
+        bt_scan_resume_adv = false;
+        bt_scan_restore_disabled = false;
+        return false;
+    }
+
+    scanner->clearResults();
+    scanner->setActiveScan(true);
+    scanner->setInterval(160);
+    scanner->setWindow(80);
+
+    bt_scan_running = true;
+    bool started = scanner->start(BT_SCAN_DURATION_S, btScanCompleteCallback, false);
+    if (!started) {
+        bt_scan_running = false;
+        if (bt_scan_resume_adv && config_bt_enabled && !bt_connected) btStartAdvertising();
+        if (bt_scan_restore_disabled) btSetEnabled(false);
+        bt_scan_resume_adv = false;
+        bt_scan_restore_disabled = false;
+        return false;
+    }
+    return true;
+}
+
+bool btScanInProgress() {
+    return bt_scan_running;
+}
+
+bool btScanTakeResults(BtScanEntry* out, int max_out, int* out_count, int* out_total, bool* out_ok) {
+    if (max_out < 0 || (max_out > 0 && !out)) return false;
+    if (bt_scan_running || !bt_scan_done) return false;
+
+    int copied = bt_scan_count;
+    if (copied > max_out) copied = max_out;
+    for (int i = 0; i < copied; i++) {
+        out[i] = bt_scan_results[i];
+    }
+
+    if (out_count) *out_count = copied;
+    if (out_total) *out_total = bt_scan_total_found;
+    if (out_ok) *out_ok = bt_scan_ok;
+
+    if (bt_scan_resume_adv && config_bt_enabled && !bt_connected) {
+        btStartAdvertising();
+    }
+    if (bt_scan_restore_disabled) {
+        btSetEnabled(false);
+    }
+
+    bt_scan_done = false;
+    bt_scan_ok = false;
+    bt_scan_total_found = 0;
+    bt_scan_count = 0;
+    bt_scan_resume_adv = false;
+    bt_scan_restore_disabled = false;
+    return true;
 }

@@ -238,7 +238,7 @@ static void agentRunCommand(char* line) {
         return;
     }
     if (strcasecmp(p, "HELP") == 0) {
-        agentReplyOk("commands=PING HELP STATE RESULT TRACE TERMDBG TERMSNAP TERMHEX TERMRANGE KEY PRESS TEXT CMD WAIT RENDER BOOTOFF");
+        agentReplyOk("commands=PING HELP STATE GNSS RESULT TRACE TERMDBG TERMSNAP TERMHEX TERMRANGE KEY PRESS TEXT CMD WAIT RENDER BOOTOFF");
         return;
     }
 
@@ -350,6 +350,33 @@ static void agentRunCommand(char* line) {
 
     if (!agentTakeStateLock()) {
         agentReplyErr("busy: state lock timeout");
+        return;
+    }
+
+    if (strcasecmp(p, "GNSS") == 0) {
+        GnssSnapshot snap;
+        gnssGetSnapshot(&snap);
+        uint32_t now_ms = millis();
+        uint32_t age_ms = (snap.last_rx_ms > 0 && now_ms >= snap.last_rx_ms) ? (now_ms - snap.last_rx_ms) : 0;
+        agentReplyOk(
+            "GNSS pwr=%d fix=%d rmc=%d gga=%d loc=%d time=%d sats=%d baud=%d bsw=%u bytes=%u sents=%u csum=%u parse=%u last_rx=%u age=%u",
+            snap.power_on ? 1 : 0,
+            snap.has_fix ? 1 : 0,
+            snap.has_rmc ? 1 : 0,
+            snap.has_gga ? 1 : 0,
+            snap.has_location ? 1 : 0,
+            snap.has_time ? 1 : 0,
+            snap.satellites,
+            snap.uart_baud,
+            snap.baud_switches,
+            snap.total_bytes,
+            snap.total_sentences,
+            snap.checksum_failures,
+            snap.parse_failures,
+            snap.last_rx_ms,
+            age_ms
+        );
+        xSemaphoreGive(state_mutex);
         return;
     }
 

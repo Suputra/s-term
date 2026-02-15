@@ -145,9 +145,10 @@ Run `ssh` from the command prompt to switch to terminal mode. The device connect
 
 ### Bluetooth (bare mode)
 
-Bluetooth is runtime-toggleable from the command prompt with a single command:
+Bluetooth is runtime-toggleable from the command prompt:
 
 - `bt` toggles Bluetooth on/off
+- `bs` scans nearby BLE devices
 
 To reduce unwanted phone wakes, advertising is not kept alive indefinitely.
 
@@ -170,10 +171,13 @@ Touch **Up/Down arrows** in command mode to browse previous/next commands.
 | `np` | Switch to notepad mode without clearing the buffer |
 | `dc` | Disconnect SSH |
 | `ws` | Scan WiFi and retry known APs manually |
+| `wfi` | Toggle WiFi on/off |
+| `bs` | Scan nearby BLE devices (non-blocking) |
 | `bt` | Toggle Bluetooth on/off |
 | `gnss` | Toggle GNSS on/off |
+| `gs` | Scan GNSS details (non-blocking: fix/sats/time/lat/lon/alt/hdop/speed/course) |
 | `gnssraw` | Show latest raw RMC/GGA lines |
-| `s` / `status` | Show WiFi/SSH/VPN/battery status (includes BT details + GNSS fix/sats) |
+| `s` / `status` | Show WiFi/SSH/VPN/battery status (GNSS on/off only) |
 | `h` / `help` | Show help |
 | `<name>` or `<name>.x` | Run shortcut script from `/<name>.x` |
 

@@ -10,11 +10,15 @@ struct GnssSnapshot {
     bool has_location;
     bool has_hdop;
     bool has_altitude;
+    bool has_speed;
+    bool has_course;
     bool has_rmc;
     bool has_gga;
     int satellites;
     float hdop;
     float altitude_m;
+    float speed_knots;
+    float course_deg;
     double latitude_deg;
     double longitude_deg;
     char utc_time[16];
@@ -27,6 +31,8 @@ struct GnssSnapshot {
     uint32_t checksum_failures;
     uint32_t parse_failures;
     uint32_t last_rx_ms;
+    int uart_baud;
+    uint32_t baud_switches;
 };
 
 static GnssSnapshot gnss_state = {};
@@ -35,6 +41,41 @@ static bool gnss_gga_fix = false;
 static bool gnss_uart_started = false;
 static char gnss_line_buf[128];
 static size_t gnss_line_len = 0;
+static constexpr int GNSS_BAUD_CANDIDATES[] = {38400, 9600, 115200, 57600};
+static constexpr size_t GNSS_BAUD_CANDIDATE_COUNT = sizeof(GNSS_BAUD_CANDIDATES) / sizeof(GNSS_BAUD_CANDIDATES[0]);
+static constexpr uint32_t GNSS_BAUD_PROBE_MS = 6000;
+static constexpr uint32_t GNSS_BAUD_PROBE_MIN_BYTES = 64;
+static int gnss_baud_index = 0;
+static uint32_t gnss_baud_set_ms = 0;
+static uint32_t gnss_baud_set_bytes = 0;
+static bool gnss_seen_valid_sentence = false;
+
+bool gnssSetUartBaudByIndex(int idx) {
+    if (!gnss_uart_started) return false;
+    if (idx < 0 || (size_t)idx >= GNSS_BAUD_CANDIDATE_COUNT) return false;
+    int baud = GNSS_BAUD_CANDIDATES[idx];
+    Serial2.updateBaudRate((unsigned long)baud);
+    gnss_state.uart_baud = baud;
+    gnss_baud_index = idx;
+    gnss_baud_set_ms = millis();
+    gnss_baud_set_bytes = gnss_state.total_bytes;
+    gnss_line_len = 0;
+    gnss_state.baud_switches++;
+    SERIAL_LOGF("GNSS: UART baud %d\n", baud);
+    return true;
+}
+
+void gnssMaybeProbeNextBaud() {
+    if (!gnss_state.power_on || !gnss_uart_started || gnss_seen_valid_sentence) return;
+    if ((size_t)(gnss_baud_index + 1) >= GNSS_BAUD_CANDIDATE_COUNT) return;
+
+    uint32_t now = millis();
+    uint32_t elapsed = (now >= gnss_baud_set_ms) ? (now - gnss_baud_set_ms) : 0;
+    uint32_t bytes_since_set = gnss_state.total_bytes - gnss_baud_set_bytes;
+    if (elapsed < GNSS_BAUD_PROBE_MS || bytes_since_set < GNSS_BAUD_PROBE_MIN_BYTES) return;
+
+    gnssSetUartBaudByIndex(gnss_baud_index + 1);
+}
 
 int gnssHexNibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -142,6 +183,22 @@ void gnssParseRmc(char** fields, int n, const char* sentence) {
     gnss_rmc_fix = (status == 'A');
     gnssUpdateFixFlag();
 
+    if (n > 7) {
+        float speed_knots = 0.0f;
+        if (gnssParseFloat(fields[7], &speed_knots)) {
+            gnss_state.speed_knots = speed_knots;
+            gnss_state.has_speed = true;
+        }
+    }
+
+    if (n > 8) {
+        float course_deg = 0.0f;
+        if (gnssParseFloat(fields[8], &course_deg)) {
+            gnss_state.course_deg = course_deg;
+            gnss_state.has_course = true;
+        }
+    }
+
     if (n > 6) {
         double lat = 0.0;
         double lon = 0.0;
@@ -220,6 +277,8 @@ void gnssHandleSentence(const char* sentence) {
         return;
     }
 
+    gnss_seen_valid_sentence = true;
+
     char work[128];
     gnssCopyStr(work, sizeof(work), sentence + 1); // skip '$'
 
@@ -254,11 +313,15 @@ void gnssResetSessionData() {
     gnss_state.has_location = false;
     gnss_state.has_hdop = false;
     gnss_state.has_altitude = false;
+    gnss_state.has_speed = false;
+    gnss_state.has_course = false;
     gnss_state.has_rmc = false;
     gnss_state.has_gga = false;
     gnss_state.satellites = -1;
     gnss_state.hdop = 0.0f;
     gnss_state.altitude_m = 0.0f;
+    gnss_state.speed_knots = 0.0f;
+    gnss_state.course_deg = 0.0f;
     gnss_state.latitude_deg = 0.0;
     gnss_state.longitude_deg = 0.0;
     gnss_state.utc_time[0] = '\0';
@@ -271,6 +334,13 @@ void gnssResetSessionData() {
     gnss_state.checksum_failures = 0;
     gnss_state.parse_failures = 0;
     gnss_state.last_rx_ms = 0;
+    gnss_state.uart_baud = (gnss_uart_started && gnss_baud_index >= 0 && (size_t)gnss_baud_index < GNSS_BAUD_CANDIDATE_COUNT)
+                               ? GNSS_BAUD_CANDIDATES[gnss_baud_index]
+                               : 0;
+    gnss_state.baud_switches = 0;
+    gnss_baud_set_ms = millis();
+    gnss_baud_set_bytes = 0;
+    gnss_seen_valid_sentence = false;
     gnss_line_len = 0;
 }
 
@@ -281,6 +351,10 @@ void gnssInit() {
     gnss_rmc_fix = false;
     gnss_gga_fix = false;
     gnss_uart_started = false;
+    gnss_baud_index = 0;
+    gnss_baud_set_ms = 0;
+    gnss_baud_set_bytes = 0;
+    gnss_seen_valid_sentence = false;
     gnss_line_len = 0;
     // Note: BOARD_1V8_EN is shared with touch controller — keep it on.
     // Only control GPS_EN for GPS power.
@@ -295,11 +369,14 @@ bool gnssSetPower(bool on) {
         delay(5);
         digitalWrite(BOARD_GPS_EN, HIGH);
         delay(20);
-        Serial2.begin(9600, SERIAL_8N1, BOARD_GPS_RXD, BOARD_GPS_TXD);
+        gnss_baud_index = 0;
+        Serial2.begin((unsigned long)GNSS_BAUD_CANDIDATES[gnss_baud_index], SERIAL_8N1, BOARD_GPS_RXD, BOARD_GPS_TXD);
         gnss_uart_started = true;
         gnss_state.power_on = true;
         gnssResetSessionData();
         gnss_state.power_on = true;
+        gnss_state.uart_baud = GNSS_BAUD_CANDIDATES[gnss_baud_index];
+        SERIAL_LOGF("GNSS: UART baud %d\n", gnss_state.uart_baud);
         SERIAL_LOGLN("GNSS: powered on");
         return true;
     }
@@ -315,6 +392,8 @@ bool gnssSetPower(bool on) {
     gnss_rmc_fix = false;
     gnss_gga_fix = false;
     gnssUpdateFixFlag();
+    gnss_state.uart_baud = 0;
+    gnss_seen_valid_sentence = false;
     gnss_line_len = 0;
     SERIAL_LOGLN("GNSS: powered off");
     return true;
@@ -359,6 +438,8 @@ void gnssPoll() {
             gnss_line_len = 0;
         }
     }
+
+    gnssMaybeProbeNextBaud();
 }
 
 bool gnssFormatUtc(const GnssSnapshot* snap, char* out, size_t out_len) {

@@ -32,6 +32,10 @@ static constexpr uint32_t SHORTCUT_WAIT_TIMEOUT_MS = 300000;
 static char shortcut_pending_path[SHORTCUT_PATH_MAX] = "";
 static char shortcut_pending_name[SHORTCUT_NAME_MAX] = "";
 static bool wifi_scan_pending = false;
+static bool bt_scan_pending = false;
+static bool gnss_scan_pending = false;
+static uint32_t gnss_scan_started_ms = 0;
+static constexpr uint32_t GNSS_SCAN_DWELL_MS = 2000;
 
 void finishWifiScanCommand() {
     int n = WiFi.scanComplete();
@@ -68,7 +72,7 @@ void finishWifiScanCommand() {
             break;
         }
     }
-    cmdAddLine(has_known ? "Use cmd: wifi" : "No known SSIDs in scan");
+    cmdAddLine(has_known ? "Use cmd: wfi" : "No known SSIDs in scan");
 
     WiFi.scanDelete();
     render_requested = true;
@@ -1330,12 +1334,132 @@ void wifiScanCommand() {
     cmdSetResult("Scanning WiFi...");
 }
 
+void finishGnssScanCommand() {
+    GnssSnapshot snap;
+    gnssGetSnapshot(&snap);
+
+    uint32_t age_ms = 0;
+    if (snap.last_rx_ms > 0) {
+        uint32_t now_ms = millis();
+        if (now_ms >= snap.last_rx_ms) age_ms = now_ms - snap.last_rx_ms;
+    }
+
+    cmdClearResult();
+    cmdAddLine("GNSS:%s fix:%s", snap.power_on ? "on" : "off", snap.has_fix ? "yes" : "no");
+    cmdAddLine("RMC:%s GGA:%s", snap.has_rmc ? "yes" : "no", snap.has_gga ? "yes" : "no");
+    cmdAddLine("Sat:%d", snap.satellites >= 0 ? snap.satellites : -1);
+
+    char utc[40];
+    if (gnssFormatUtc(&snap, utc, sizeof(utc))) cmdAddLine("UTC:%s", utc);
+    else cmdAddLine("UTC:-");
+
+    if (snap.has_location) {
+        cmdAddLine("Lat:%.6f", snap.latitude_deg);
+        cmdAddLine("Lon:%.6f", snap.longitude_deg);
+    } else {
+        cmdAddLine("Loc:-");
+    }
+
+    if (snap.has_altitude) cmdAddLine("Alt:%.1fm", snap.altitude_m);
+    else cmdAddLine("Alt:-");
+
+    if (snap.has_hdop) cmdAddLine("HDOP:%.2f", snap.hdop);
+    else cmdAddLine("HDOP:-");
+
+    if (snap.has_speed) cmdAddLine("Spd:%.2fkt %.2fkmh", snap.speed_knots, snap.speed_knots * 1.852f);
+    else cmdAddLine("Spd:-");
+
+    if (snap.has_course) cmdAddLine("Course:%.1fdeg", snap.course_deg);
+    else cmdAddLine("Course:-");
+
+    if (snap.power_on) cmdAddLine("baud:%d age:%lus", snap.uart_baud, (unsigned long)(age_ms / 1000U));
+    cmdAddLine("bytes:%u s:%u c:%u p:%u",
+               snap.total_bytes,
+               snap.total_sentences,
+               snap.checksum_failures,
+               snap.parse_failures);
+    gnss_scan_pending = false;
+    render_requested = true;
+}
+
+void gnssScanPoll() {
+    if (!gnss_scan_pending) return;
+    if ((uint32_t)(millis() - gnss_scan_started_ms) < GNSS_SCAN_DWELL_MS) return;
+    finishGnssScanCommand();
+}
+
+void gnssScanCommand() {
+    if (gnss_scan_pending) {
+        cmdSetResult("GNSS scan already running");
+        return;
+    }
+    gnss_scan_pending = true;
+    gnss_scan_started_ms = millis();
+    cmdSetResult("Scanning GNSS...");
+}
+
+void finishBtScanCommand() {
+    BtScanEntry found[BT_SCAN_MAX_RESULTS];
+    int shown = 0;
+    int total = 0;
+    bool ok = false;
+    if (!btScanTakeResults(found, BT_SCAN_MAX_RESULTS, &shown, &total, &ok)) return;
+    bt_scan_pending = false;
+
+    if (!ok) {
+        cmdSetResult("BT scan failed");
+        render_requested = true;
+        return;
+    }
+
+    cmdClearResult();
+    cmdAddLine("BT scan: %d device(s)", total);
+
+    int max_listed = CMD_RESULT_LINES - 1;
+    if (shown > max_listed) shown = max_listed;
+    for (int i = 0; i < shown; i++) {
+        const char* label = found[i].has_name ? found[i].name : found[i].addr;
+        cmdAddLine("%c %s %ddBm", found[i].has_name ? '*' : ' ', label, found[i].rssi);
+    }
+    if (total > shown) cmdAddLine("... +%d more", total - shown);
+    render_requested = true;
+}
+
+void btScanPoll() {
+    if (!bt_scan_pending) return;
+    if (btScanInProgress()) return;
+    finishBtScanCommand();
+}
+
+void btScanCommand() {
+    if (bt_scan_pending) {
+        cmdSetResult("BT scan already running");
+        return;
+    }
+    if (btIsConnected()) {
+        cmdSetResult("BT scan unavailable while connected");
+        return;
+    }
+    if (!btScanStartAsync()) {
+        cmdSetResult("BT scan failed");
+        return;
+    }
+    bt_scan_pending = true;
+    cmdSetResult("Scanning BT...");
+}
+
 void gnssRawCommand() {
     GnssSnapshot snap;
     gnssGetSnapshot(&snap);
 
     cmdClearResult();
-    cmdAddLine("GNSS:%s raw", snap.power_on ? "on" : "off");
+    cmdAddLine("GNSS:%s raw baud:%d", snap.power_on ? "on" : "off", snap.uart_baud);
+    cmdAddLine("bytes:%u sents:%u csum:%u parse:%u bsw:%u",
+               snap.total_bytes,
+               snap.total_sentences,
+               snap.checksum_failures,
+               snap.parse_failures,
+               snap.baud_switches);
     if (snap.last_rmc[0] != '\0') cmdAddLine("RMC:%s", snap.last_rmc);
     if (snap.last_gga[0] != '\0') cmdAddLine("GGA:%s", snap.last_gga);
     if (snap.last_rmc[0] == '\0' && snap.last_gga[0] == '\0') cmdAddLine("No NMEA yet");
@@ -1493,11 +1617,17 @@ bool executeCommand(const char* cmd) {
         cmdSetResult("Disconnected");
     } else if (strcmp(word, "ws") == 0) {
         wifiScanCommand();
-    } else if (strcmp(word, "wifi") == 0) {
+    } else if (strcmp(word, "wfi") == 0) {
         if (arg[0] != '\0') {
-            cmdSetResult("wifi (toggle only)");
+            cmdSetResult("wfi (toggle only)");
         } else {
             wifiToggleCommand();
+        }
+    } else if (strcmp(word, "bs") == 0) {
+        if (arg[0] != '\0') {
+            cmdSetResult("bs (no args)");
+        } else {
+            btScanCommand();
         }
     } else if (strcmp(word, "bt") == 0) {
         if (arg[0] != '\0') {
@@ -1506,6 +1636,12 @@ bool executeCommand(const char* cmd) {
             bool next = !btIsEnabled();
             btSetEnabled(next);
             cmdSetResult("BT %s (%s)", next ? "on" : "off", btStatusShort());
+        }
+    } else if (strcmp(word, "gs") == 0) {
+        if (arg[0] != '\0') {
+            cmdSetResult("gs (no args)");
+        } else {
+            gnssScanCommand();
         }
     } else if (strcmp(word, "gnss") == 0) {
         if (arg[0] != '\0') {
@@ -1542,13 +1678,7 @@ bool executeCommand(const char* cmd) {
         }
         GnssSnapshot gnss;
         gnssGetSnapshot(&gnss);
-        char sats[8];
-        if (gnss.satellites >= 0) snprintf(sats, sizeof(sats), "%d", gnss.satellites);
-        else snprintf(sats, sizeof(sats), "-");
-        cmdAddLine("GNSS:%s fix:%s sats:%s",
-                   gnss.power_on ? "on" : "off",
-                   gnss.has_fix ? "yes" : "no",
-                   sats);
+        cmdAddLine("GNSS:%s", gnss.power_on ? "on" : "off");
         cmdAddLine("Bat:%d%% Heap:%dK", battery_pct, ESP.getFreeHeap() / 1024);
         cmdAddLine("Clock:%s(%s)",
                    timeSyncClockLooksValid() ? "set" : "unset",
@@ -1560,7 +1690,7 @@ bool executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("l/ls e/edit w/save daily r/rm");
         cmdAddLine("u/upload d/download p/paste ssh np dc");
-        cmdAddLine("ws wifi bt gnss gnssraw");
+        cmdAddLine("ws wfi bs bt gnss gs gnssraw");
         cmdAddLine("date s/status h/help");
         cmdAddLine("<name> runs /name.x shortcut");
     } else {
