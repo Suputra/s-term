@@ -1590,6 +1590,7 @@ void autoSaveDirty() {
 #include "time_sync_module.hpp"
 #include "network_module.hpp"
 #include "gnss_module.hpp"
+#include "modem_module.hpp"
 #include "bluetooth_module.hpp"
 #include "screen_module.hpp"
 #include "keyboard_module.hpp"
@@ -1713,6 +1714,10 @@ void setup() {
     gpio_hold_dis((gpio_num_t)BOARD_LORA_EN);
     gpio_hold_dis((gpio_num_t)BOARD_GPS_EN);
     gpio_hold_dis((gpio_num_t)BOARD_1V8_EN);
+    gpio_hold_dis((gpio_num_t)BOARD_MODEM_POWER_EN);
+    gpio_hold_dis((gpio_num_t)BOARD_MODEM_PWRKEY);
+    gpio_hold_dis((gpio_num_t)BOARD_MODEM_DTR);
+    gpio_hold_dis((gpio_num_t)BOARD_MODEM_RST);
     gpio_hold_dis((gpio_num_t)BOARD_KEYBOARD_LED);
     gpio_hold_dis((gpio_num_t)BOARD_LORA_CS);
     gpio_hold_dis((gpio_num_t)BOARD_LORA_RST);
@@ -1730,6 +1735,10 @@ void setup() {
     // Disable unused peripherals
     pinMode(BOARD_LORA_EN, OUTPUT);        digitalWrite(BOARD_LORA_EN, LOW);
     pinMode(BOARD_GPS_EN, OUTPUT);         digitalWrite(BOARD_GPS_EN, LOW);
+    pinMode(BOARD_MODEM_POWER_EN, OUTPUT); digitalWrite(BOARD_MODEM_POWER_EN, LOW);
+    pinMode(BOARD_MODEM_PWRKEY, OUTPUT);   digitalWrite(BOARD_MODEM_PWRKEY, LOW);
+    pinMode(BOARD_MODEM_DTR, OUTPUT);      digitalWrite(BOARD_MODEM_DTR, LOW);
+    pinMode(BOARD_MODEM_RST, OUTPUT);      digitalWrite(BOARD_MODEM_RST, HIGH);
     // Enable 1.8V rail early (powers touch controller)
     pinMode(BOARD_1V8_EN, OUTPUT);         digitalWrite(BOARD_1V8_EN, HIGH);
     // Keyboard backlight off
@@ -1832,6 +1841,7 @@ void setup() {
     sdLoadConfig();
     timeSyncSetTimeZone(config_time_tz);
     gnssInit();
+    modemInit();
     btInit();
     updateBattery();  // Seed battery_pct before the first status bar render.
 
@@ -1861,9 +1871,12 @@ void setup() {
 void loop() {
     agentPollSerial();
     perfLoopTick();
+    modemPoll();
     wifiScanPoll();
     btScanPoll();
     gnssScanPoll();
+    modemScanPoll();
+    modemPowerNotifyPoll();
     gnssPoll();
 
     // Press BOOT to request power-off (same behavior as the "off" command).

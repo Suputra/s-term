@@ -1,82 +1,64 @@
 # T-Deck Pro Notepad
 
-Firmware for the LilyGo T-Deck Pro — a pocket notepad with SSH terminal, file manager, WireGuard VPN, and optional barebones BLE peripheral pairing.
+Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, optional WireGuard fallback, and optional BLE/GPS/4G features.
 
-## Build & Flash
+## Overview
+- Default mode is a keyboard-driven notepad rendered on the e-ink panel.
+- `ssh` switches to terminal mode (WiFi first, then VPN fallback when configured).
+- Files live on SD root and can be edited/saved on-device or transferred with SCP (`upload` / `download`).
+- Bluetooth mode is a BLE peripheral service (not a HID keyboard), so phones keep their on-screen keyboard.
 
-Requires [PlatformIO](https://platformio.org/). All dependencies are fetched automatically on first build.
+## Quickstart
+### 1) Install tools
+Requires PlatformIO (`pio`) and `uv`.
 
-### Quick setup (`uv`, no virtualenv)
-
-Run this once:
-
-```bash
-uv tool install --force platformio && uv tool update-shell && export PATH="$(uv tool dir --bin):$PATH" && hash -r
-```
-
-After that, use plain `pio` commands:
+If `pio` is not already available:
 
 ```bash
-pio run              # build
-pio run -t upload    # flash via USB-C
-pio device monitor   # serial output
+uv tool install --force platformio
+uv tool update-shell
+export PATH="$(uv tool dir --bin):$PATH"
+hash -r
 ```
 
-### Debug automation build
-
-Two PlatformIO environments are available:
-
-```bash
-pio run -e T-Deck-Pro -t upload        # production (agent protocol disabled)
-pio run -e T-Deck-Pro-debug -t upload  # debug (agent protocol enabled)
-```
-
-With debug firmware flashed, you can drive the device over serial:
+Install Python deps used by helper scripts:
 
 ```bash
 uv sync
-uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"
-uv run scripts/tdeck_agent.py "PRESS MIC" "WAIT 500" "STATE"
-uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"
 ```
 
-You can also capture screen evidence from the default IP camera feed (`http://10.0.44.199:4747/`):
-
-```bash
-uv run scripts/capture_webcam.py --image artifacts/screen.jpg
-```
-
-Recommended end-to-end smoke command (write + render + capture + checks):
-
-```bash
-uv run scripts/agent_smoke.py --boot-wait 2
-```
-
-To use a different camera source:
-
-```bash
-uv run scripts/agent_smoke.py --camera-source "http://<ip>:4747/" --boot-wait 2
-uv run scripts/capture_webcam.py --source "0" --image artifacts/usb-webcam.jpg
-```
-
-If a local webcam index is wrong or captures are black:
-
-```bash
-uv run scripts/probe_cameras.py --max-index 5
-```
-
-Alternative setup script:
+Alternative setup helper:
 
 ```bash
 source scripts/setup-pio.sh
 ```
 
-## SD Card Config
-
-Credentials are loaded from a `/CONFIG` file on the SD card (FAT32). Section-based format with `#` comments and blank lines ignored. Section headers are `# wifi`, `# ssh`, `# vpn`, `# bt`, `# time`.
-
+### 2) Flash production firmware
+```bash
+pio run -e T-Deck-Pro -t upload
 ```
-# wifi (SSID/password pairs; blank or missing password means open WiFi)
+
+(Optional serial output)
+
+```bash
+pio device monitor
+```
+
+### 3) Add SD card config
+Create `/CONFIG` on a FAT32 SD card (format below), insert card, and reboot.
+
+### 4) Start using the device
+Type in notepad mode. Single-tap `MIC` to open command mode. Use `h` for command help.
+
+For debug automation and camera capture flow, see `Development` at the bottom.
+
+## SD Card Configuration (`/CONFIG`)
+`/CONFIG` is section-based. Section lines start with `#` and include one of: `wifi`, `ssh`, `vpn`, `bt`, `time`.
+
+Example:
+
+```text
+# wifi
 home_ssid
 home_password
 office_guest_open
@@ -89,141 +71,123 @@ hotspot_password
 22
 user
 password
-# optional: host to use only when SSH is attempted via VPN
-# (useful if direct host is a local shortname that doesn't resolve over tunnel DNS)
 10.207.162.10
 
-# vpn (omit section if not using VPN)
+# vpn
 <device_private_key_base64>
 <server_public_key_base64>
 <preshared_key_base64>
 <device_vpn_ip>
 <endpoint_host_or_ip>
 51820
-# optional: DNS server to use while VPN is active
 10.0.0.1
 
-# bt (optional)
-# optional auto-enable at boot; otherwise BT stays off until `bt on`
+# bt
 enable
 TDeck-Pro
-# optional 6-digit static passkey for secure pairing
 123456
 
-# time (optional, POSIX TZ string for local date/time display + daily files)
+# time
 PST8PDT,M3.2.0,M11.1.0
 ```
 
-Open WiFi entries: put only the SSID and leave the password line blank (or end the WiFi section right after the SSID).
-
-`# bt` parsing is positional:
-1. Optional `enable`/`on`/`true`/`1` to auto-enable Bluetooth at boot
-2. Device name
-3. Optional 6-digit passkey
-
-If `# bt` section is missing, BLE stays disabled.
-If BT is enabled, the device advertises as a generic BLE peripheral (not a keyboard), so phones keep their on-screen keyboard.
-
-If `# time` is missing, timezone defaults to `UTC0`.
+Notes:
+- `# wifi`: lines are SSID/password pairs. If password is blank (or section ends right after SSID), that AP is treated as open.
+- `# ssh`: host, port, user, password, optional VPN-only host override.
+- `# vpn`: private key, server pubkey, PSK, local VPN IP, endpoint, port, optional DNS.
+- `# bt`: parsed in order as optional boot-state token (`enable`/`on`/`true`/`1` or `disable`/`off`/`false`/`0`), optional device name, optional 6-digit passkey.
+- If `# bt` is missing, Bluetooth stays off at boot. Runtime control is the `bt` command (toggle only).
+- If `# time` is missing, timezone defaults to `UTC0`.
 
 ## Usage
-
 ### Notepad (default mode)
-
 Type on the keyboard. Text wraps to the e-ink display.
 
-- **Shift** — sticky uppercase (one letter)
-- **Sym** — one-shot symbol/number layer
-- **Touch tap** — directional arrows (tap away from center for up/down/left/right)
+- `Shift`: sticky uppercase (one letter)
+- `Sym`: one-shot symbol/number layer
+- Touch tap: directional arrows (tap away from center for up/down/left/right)
 
 ### Terminal
+Run `ssh` from command mode to switch to terminal mode. Device connects WiFi, tries SSH directly, and falls back through WireGuard when configured and needed. Run `np` to return to notepad.
 
-Run `ssh` from the command prompt to switch to terminal mode. The device connects WiFi, tries SSH directly, and if the host isn't reachable falls back through WireGuard VPN automatically. Run `np` from the command prompt to return to notepad.
-
-- **Alt** — acts as ctrl - alt + space -> esc
-- **Touch tap** — sends terminal arrow keys (up/down/left/right)
+- `Alt`: acts as Ctrl (`Alt + Space` sends Esc)
+- Touch tap: sends terminal arrow keys
 
 ### Bluetooth (bare mode)
+Bluetooth is runtime-toggleable from command mode:
 
-Bluetooth is runtime-toggleable from the command prompt:
+- `bt`: toggle Bluetooth on/off
+- `bs`: scan nearby BLE devices
 
-- `bt` toggles Bluetooth on/off
-- `bs` scans nearby BLE devices
-
-To reduce unwanted phone wakes, advertising is not kept alive indefinitely.
+Advertising is not kept alive indefinitely (times out to idle) to reduce unwanted wakeups.
 
 ### Command Processor
-
-Single-tap **MIC** from either mode to open the command prompt (bottom half of screen).
-Touch **Up/Down arrows** in command mode to browse previous/next commands.
+Single-tap `MIC` from any mode to open command mode (bottom half of screen).
+Touch arrows in command mode browse command history. In file-picker mode: Up/Down moves, Left/Right pages.
 
 | Command | Description |
 |---------|-------------|
 | `l` / `ls` | List files on SD card |
-| `e` / `edit [file]` | Edit a file (loads into notepad). With no filename, opens interactive picker (W/S move, A/D page, Enter open). |
-| `w` / `save` | Save notepad to current file |
+| `e` / `edit [file]` | Edit a file. With no filename, opens interactive picker (W/S move, A/D page, Enter open). |
+| `w` / `save [file]` | Save notepad to current file (or provided filename) |
 | `daily` | Open today’s file as `YYYY-MM-DD.md` (local timezone) |
 | `r` / `rm <file>` | Delete a file |
 | `u` / `upload` | SCP all SD files to `~/tdeck` on SSH host |
 | `d` / `download` | SCP `~/tdeck` files to SD card |
 | `p` / `paste` | Paste notepad to SSH |
-| `ssh` | Switch to terminal mode and start SSH connect if needed |
-| `np` | Switch to notepad mode without clearing the buffer |
+| `ssh` | Switch to terminal mode and connect if needed |
+| `np` | Return to notepad mode |
 | `dc` | Disconnect SSH |
-| `ws` | Scan WiFi and retry known APs manually |
+| `ws` | Scan WiFi and retry known APs |
 | `wfi` | Toggle WiFi on/off |
+| `mds` | 4G modem status scan (non-blocking) |
+| `mdm` | Toggle 4G modem power (non-blocking) |
 | `bs` | Scan nearby BLE devices (non-blocking) |
 | `bt` | Toggle Bluetooth on/off |
-| `gnss` | Toggle GNSS on/off |
-| `gs` | Scan GNSS details (non-blocking: fix/sats/time/lat/lon/alt/hdop/speed/course) |
-| `s` / `status` | Show WiFi/SSH/VPN/battery status (GNSS on/off only) |
+| `gps` | Toggle GPS on/off |
+| `gs` / `gpss` | GPS detail scan (non-blocking) |
+| `date` | Show local date/time and sync source |
+| `s` / `status` | Show WiFi/4G/SSH/BT/GPS/battery/clock status |
 | `h` / `help` | Show help |
 | `<name>` or `<name>.x` | Run shortcut script from `/<name>.x` |
 
-GNSS stays off by default and is activated by `gnss` toggle.
-When GNSS has valid UTC + fix, firmware auto-syncs system clock. NTP sync (VPN path) also updates the same clock.
+GPS is off by default. When GPS has valid UTC + fix, firmware auto-syncs system clock. NTP sync (over network/VPN) updates the same clock.
 
 ### `.x` Shortcut Scripts
-
 Shortcut scripts are plain text files on SD root with extension `.x`.
-You can edit them with `edit <name>.x`, and run them by typing `<name>` (or `<name>.x`) in the command prompt.
+Edit with `edit <name>.x`. Run with `<name>` (or `<name>.x`) in command mode.
 
-How name resolution works:
-
-- Typing `deploy` runs `/deploy.x`
-- Typing `deploy.x` runs `/deploy.x`
-- Names must be SD-safe (`a-z`, `A-Z`, `0-9`, `.`, `_`, `-`)
+Name resolution:
+- `deploy` runs `/deploy.x`
+- `deploy.x` runs `/deploy.x`
+- Valid chars: `a-z`, `A-Z`, `0-9`, `.`, `_`, `-`
 - Only one shortcut runs at a time
 
-Parsing and execution behavior:
-
+Parsing/execution:
 - Blank lines and lines starting with `#` are ignored
 - Max `24` executable lines per file
-- Max line length is `159` chars (longer lines fail parse)
+- Max line length `159` chars
 - Steps execute in order and stop on first failure
-- Status/progress appears in command result area (`Run <name> <i>/<n>`, then `Shortcut done: <name>`)
+- Progress appears in command result area (`Run <name> <i>/<n>`, then `Shortcut done: <name>`)
 
-Supported steps (one per line):
-
-- `upload` / `u`: start upload task (same as command-palette `upload`)
-- `download` / `d`: start download task (same as command-palette `download`)
-- `wait upload` / `wait download`: wait for transfer completion (5 min timeout)
-- `wait <ms>`: sleep/delay for milliseconds
-- `remote <command>` / `exec <command>`: run `<command>` on remote via SSH (`/bin/sh -s`), require remote exit code `0`
-- `cmd <command>`: run any existing command-palette command (for example `cmd daily`, `cmd ssh`, `cmd np`)
-- `<any command-palette command>`: bare command lines are also executed directly (`daily`, `status`, etc.)
+Supported steps:
+- `upload` / `u`
+- `download` / `d`
+- `wait upload` / `wait download`
+- `wait <ms>`
+- `remote <command>` / `exec <command>`
+- `cmd <command>`
+- Any bare command-mode command (`daily`, `status`, etc.)
 
 Remote-step notes:
-
-- If SSH is not connected, shortcut runtime will try to connect first
+- If SSH is disconnected, shortcut runtime will try to connect first
 - SSH connect wait window is up to ~45s per remote step
-- Non-zero remote exit fails the shortcut and surfaces `Remote failed (<code>)`
-- If the remote step cannot produce status within the timeout window, it fails as `Remote timeout`
+- Non-zero remote exit code fails the shortcut (`Remote failed (<code>)`)
+- If no status arrives before timeout, step fails as `Remote timeout`
 
 Example `deploy.x`:
 
 ```text
-# Upload SD files, then move them on remote
 upload
 wait upload
 remote mkdir -p "$HOME/app/config"
@@ -233,7 +197,6 @@ remote cp -f "$HOME/tdeck/"*.json "$HOME/app/config/"
 Example `daily-sync.x`:
 
 ```text
-# Open today's note, save, upload, and switch back to notepad
 daily
 save
 upload
@@ -242,25 +205,109 @@ np
 ```
 
 ## Architecture
-
-Firmware entry point remains `src/main.cpp` (setup/loop and global state), while major firmware components are split into flat module headers in `src/`:
+Entry point is `src/main.cpp` (setup/loop and global state).
+Major firmware components are split into flat module headers in `src/`:
 
 - `src/network_module.hpp` (WiFi, SSH, VPN connectivity)
-- `src/bluetooth_module.hpp` (barebones BLE peripheral, pairing/bonding, runtime toggle)
+- `src/modem_module.hpp` (A7682E modem power + LTE scan helpers)
+- `src/bluetooth_module.hpp` (BLE peripheral, pairing/bonding, runtime toggle)
 - `src/screen_module.hpp` (display rendering/task logic)
 - `src/keyboard_module.hpp` (keyboard input + mode handlers)
 - `src/cli_module.hpp` (command parsing, SCP helpers, poweroff flow)
 
-Shared configuration/constants are split into:
-
+Shared config/constants:
 - `src/firmware/pins.h`
 - `src/firmware/layout.h`
 - `src/firmware/keyboard_map.h`
 - `src/firmware/network_config.h`
 
 Runtime uses two FreeRTOS cores:
+- Core 0: e-ink display rendering
+- Core 1: keyboard polling, WiFi/SSH/VPN/BLE, file I/O
 
-- **Core 0** — e-ink display rendering
-- **Core 1** — keyboard polling, WiFi/SSH/VPN/BLE, file I/O
+SPI bus is shared between e-ink and SD via cooperative `sd_busy` / `display_idle` flags.
 
-SPI bus shared between e-ink and SD card via cooperative `sd_busy`/`display_idle` flags (no mutex).
+## Development
+### Build modes
+- Production: `pio run -e T-Deck-Pro -t upload`
+- Debug automation: `pio run -e T-Deck-Pro-debug -t upload`
+
+`T-Deck-Pro-debug` enables `TDECK_AGENT_DEBUG=1` (serial automation protocol).
+Production keeps it disabled.
+
+### Fast path (write + render + capture)
+```bash
+pio run -e T-Deck-Pro-debug -t upload
+uv run scripts/agent_smoke.py --boot-wait 2
+```
+
+`agent_smoke.py`:
+1. Clears notepad
+2. Types a marker
+3. Forces render + waits
+4. Captures camera frame (default `http://10.0.44.199:4747/`)
+5. Verifies serial `text_len`
+6. Verifies capture is not black/invalid
+7. Prints `PASS` / `FAIL`
+
+Notes:
+- No OCR yet; still visually confirm marker in the image.
+- Output artifact path is printed.
+- Custom marker should avoid `0` (current `TEXT` emulation limitation).
+
+### Camera setup
+If a local webcam source is wrong or black:
+
+```bash
+uv run scripts/probe_cameras.py --max-index 5
+```
+
+Pick an index with `opened=1`, `frame=1`, and non-trivial `mean/std`, then pass `--camera-source "<idx>"`.
+
+### Full canonical loop
+1. Flash debug firmware: `pio run -e T-Deck-Pro-debug -t upload`
+2. Check serial channel: `uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"`
+3. Drive scenario commands over serial
+4. Capture artifacts:
+   - image (default feed): `uv run scripts/capture_webcam.py --image artifacts/<name>.jpg`
+   - image (custom source): `uv run scripts/capture_webcam.py --source "<url-or-idx>" --image artifacts/<name>.jpg`
+   - video (custom source): `uv run scripts/capture_webcam.py --source "<url-or-idx>" --video artifacts/<name>.mp4 --duration 8`
+5. Evaluate:
+   - no `AGENT ERR`
+   - expected `AGENT OK STATE ...` transitions
+   - expected screen content in image/video
+6. Patch and repeat
+
+### Serial protocol (debug firmware only)
+Send one command per line with `@` prefix.
+
+- `@PING`
+- `@HELP`
+- `@STATE`
+- `@KEY <row> <col_rev>`
+- `@PRESS <token> [count]`
+- `@TEXT <text-with-escapes>`
+- `@CMD <device-command-mode-command>`
+- `@WAIT <ms>`
+- `@RENDER`
+- `@BOOTOFF`
+
+Escapes in `TEXT`: `\\n`, `\\r`, `\\t`, `\\\\`, `\\s`.
+
+`PRESS` tokens:
+- Special: `MIC`, `ALT`, `SYM`, `LSHIFT`, `RSHIFT`, `SPACE`, `ENTER`, `BACKSPACE`
+- Single-char physical key tokens: letters and symbol-key positions (`q`, `w`, `1`, `?`, `-`)
+
+Examples:
+
+```bash
+uv run scripts/tdeck_agent.py "PRESS MIC" "WAIT 500" "STATE"
+uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"
+uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"
+```
+
+### Troubleshooting
+- `AGENT ERR`: scenario failure, fix command or firmware behavior.
+- Camera opens but frame is black: verify stream URL or probe camera indices and increase `--warmup`.
+- `TEXT` fails due to active modifiers: use explicit `KEY`/`PRESS` first.
+- Need release validation: flash production env and rerun manual/non-agent checks.

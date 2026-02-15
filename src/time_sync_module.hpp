@@ -23,7 +23,7 @@ static char time_sync_tz[64] = "UTC0";
 const char* timeSyncSourceName(TimeSyncSource src) {
     switch (src) {
         case TIME_SYNC_NTP:  return "ntp";
-        case TIME_SYNC_GNSS: return "gnss";
+        case TIME_SYNC_GNSS: return "gps";
         default:             return "none";
     }
 }

@@ -281,6 +281,16 @@ void drawTerminalStatusBar() {
         snprintf(status, sizeof(status), "WiFi %s%s", WiFi.localIP().toString().c_str(), bt_suffix);
     } else if (wifi_state == WIFI_CONNECTING) {
         snprintf(status, sizeof(status), "WiFi...%s", bt_suffix);
+    } else if (modemGetState() == MODEM_STATE_SCANNING) {
+        snprintf(status, sizeof(status), "4G scan...%s", bt_suffix);
+    } else if (modemGetState() == MODEM_STATE_BOOTING) {
+        snprintf(status, sizeof(status), "4G boot...%s", bt_suffix);
+    } else if (modemGetState() == MODEM_STATE_ON) {
+        int csq = modemLastCsq();
+        if (csq >= 0 && csq <= 31) snprintf(status, sizeof(status), "4G CSQ %d%s", csq, bt_suffix);
+        else snprintf(status, sizeof(status), "4G on%s", bt_suffix);
+    } else if (modemGetState() == MODEM_STATE_ERROR) {
+        snprintf(status, sizeof(status), "4G err%s", bt_suffix);
     } else {
         snprintf(status, sizeof(status), btIsConnected() ? "BT %s" : "No net%s",
                  btIsConnected() ? btPeerAddress() : bt_suffix);

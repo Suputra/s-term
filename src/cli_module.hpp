@@ -34,8 +34,11 @@ static char shortcut_pending_name[SHORTCUT_NAME_MAX] = "";
 static bool wifi_scan_pending = false;
 static bool bt_scan_pending = false;
 static bool gnss_scan_pending = false;
+static bool modem_scan_pending = false;
+static bool modem_power_pending_notice = false;
 static uint32_t gnss_scan_started_ms = 0;
 static constexpr uint32_t GNSS_SCAN_DWELL_MS = 2000;
+static constexpr uint32_t MODEM_SCAN_DWELL_MS = MODEM_SCAN_DEFAULT_DWELL_MS;
 
 void finishWifiScanCommand() {
     int n = WiFi.scanComplete();
@@ -1147,6 +1150,10 @@ inline void poweroffQuiesceHardware() {
     poweroffDriveAndHold(BOARD_LORA_EN, LOW);
     poweroffDriveAndHold(BOARD_GPS_EN, LOW);
     poweroffDriveAndHold(BOARD_1V8_EN, LOW);
+    poweroffDriveAndHold(BOARD_MODEM_POWER_EN, LOW);
+    poweroffDriveAndHold(BOARD_MODEM_PWRKEY, LOW);
+    poweroffDriveAndHold(BOARD_MODEM_DTR, LOW);
+    poweroffDriveAndHold(BOARD_MODEM_RST, HIGH);
     poweroffDriveAndHold(BOARD_KEYBOARD_LED, LOW);
 
     // Keep shared SPI devices deselected and radio reset asserted.
@@ -1217,6 +1224,7 @@ void powerOff() {
 
     // Stop BLE advertising/connection before sleeping.
     btShutdown();
+    if (modemIsPowered()) modemSetPowered(false);
 
     // Stop shared buses before sleeping.
     if (sd_mounted) SD.end();
@@ -1345,7 +1353,7 @@ void finishGnssScanCommand() {
     }
 
     cmdClearResult();
-    cmdAddLine("GNSS:%s fix:%s", snap.power_on ? "on" : "off", snap.has_fix ? "yes" : "no");
+    cmdAddLine("GPS:%s fix:%s", snap.power_on ? "on" : "off", snap.has_fix ? "yes" : "no");
     cmdAddLine("RMC:%s GGA:%s", snap.has_rmc ? "yes" : "no", snap.has_gga ? "yes" : "no");
     cmdAddLine("Sat:%d", snap.satellites >= 0 ? snap.satellites : -1);
 
@@ -1390,12 +1398,71 @@ void gnssScanPoll() {
 
 void gnssScanCommand() {
     if (gnss_scan_pending) {
-        cmdSetResult("GNSS scan already running");
+        cmdSetResult("GPS scan already running");
         return;
     }
     gnss_scan_pending = true;
     gnss_scan_started_ms = millis();
-    cmdSetResult("Scanning GNSS...");
+    cmdSetResult("Scanning GPS...");
+}
+
+void finishModemScanCommand() {
+    ModemScanResult snap;
+    if (!modemScanTakeResult(&snap)) return;
+    modem_scan_pending = false;
+
+    cmdClearResult();
+    cmdAddLine("MDS:%s %lums", snap.ok ? "ok" : "fail", (unsigned long)snap.elapsed_ms);
+    cmdAddLine("Modem:%s SIM:%s", modemStatusShort(), snap.sim_ready ? "ready" : "not ready");
+
+    if (snap.csq_last >= 0) cmdAddLine("CSQ:%d best:%d", snap.csq_last, snap.csq_best);
+    else cmdAddLine("CSQ:-");
+
+    if (snap.rssi_dbm_last > -999) cmdAddLine("RSSI:%ddBm best:%ddBm", snap.rssi_dbm_last, snap.rssi_dbm_best);
+    else cmdAddLine("RSSI:-");
+
+    if (snap.cpin[0] != '\0') cmdAddLine("%s", snap.cpin);
+    if (snap.cereg[0] != '\0') cmdAddLine("%s", snap.cereg);
+    if (snap.cpsi[0] != '\0') cmdAddLine("%s", snap.cpsi);
+    if (snap.cops[0] != '\0') cmdAddLine("%s", snap.cops);
+    if (!snap.ok && snap.error[0] != '\0') cmdAddLine("Err:%s", snap.error);
+
+    render_requested = true;
+}
+
+void modemScanPoll() {
+    if (!modem_scan_pending) return;
+    if (modemScanInProgress()) return;
+    finishModemScanCommand();
+}
+
+void modemPowerNotifyPoll() {
+    if (!modem_power_pending_notice) return;
+    bool ok = false;
+    if (!modemTakePowerOnEvent(&ok)) return;
+
+    modem_power_pending_notice = false;
+    if (ok) {
+        cmdSetResult("Modem ready");
+    } else {
+        cmdSetResult("Modem failed: %s", modemLastError()[0] ? modemLastError() : "err");
+    }
+    render_requested = true;
+}
+
+void modemScanCommand() {
+    if (modem_scan_pending) {
+        cmdSetResult("Modem scan already running");
+        return;
+    }
+    if (!modemScanStartAsync(MODEM_SCAN_DWELL_MS)) {
+        const char* err = modemLastError();
+        if (err && err[0] != '\0') cmdSetResult("Modem scan failed: %s", err);
+        else cmdSetResult("Modem scan failed");
+        return;
+    }
+    modem_scan_pending = true;
+    cmdSetResult("Modem scan starting...");
 }
 
 void finishBtScanCommand() {
@@ -1454,7 +1521,7 @@ void dailyOpenCommand() {
         ensureClockForDateDaily();
     }
     if (!timeSyncMakeDailyFilename(name, sizeof(name))) {
-        cmdSetResult("Clock unset; gnss/WiFi");
+        cmdSetResult("Clock unset; gps/WiFi");
         return;
     }
 
@@ -1481,7 +1548,7 @@ void clockDateCommand() {
         ensureClockForDateDaily();
     }
     if (!timeSyncFormatLocal(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S %Z")) {
-        cmdSetResult("Clock unset; gnss/WiFi");
+        cmdSetResult("Clock unset; gps/WiFi");
         return;
     }
     cmdSetResult("%s (%s)", stamp, timeSyncSourceName(time_sync_source));
@@ -1596,6 +1663,42 @@ bool executeCommand(const char* cmd) {
         cmdSetResult("Disconnected");
     } else if (strcmp(word, "ws") == 0) {
         wifiScanCommand();
+    } else if (strcmp(word, "mds") == 0) {
+        if (arg[0] != '\0') {
+            cmdSetResult("mds (no args)");
+        } else {
+            modemScanCommand();
+        }
+    } else if (strcmp(word, "mdm") == 0) {
+        if (arg[0] != '\0') {
+            cmdSetResult("mdm (toggle only)");
+        } else if (modemScanInProgress()) {
+            cmdSetResult("Modem scan running");
+        } else if (modemOperationInProgress()) {
+            cmdSetResult("Modem busy (%s)", modemStatusShort());
+        } else {
+            bool next = !modemIsPowered();
+            bool changed = modemSetPowered(next);
+            if (next) {
+                if (changed || modemIsPowered()) {
+                    if (changed) {
+                        modem_power_pending_notice = true;
+                        cmdSetResult("Modem booting...");
+                    } else {
+                        cmdSetResult("Modem %s", modemStatusShort());
+                    }
+                } else {
+                    cmdSetResult("Modem on failed: %s", modemLastError()[0] ? modemLastError() : "err");
+                }
+            } else {
+                modem_power_pending_notice = false;
+                if (changed || !modemIsPowered()) {
+                    cmdSetResult("Modem off");
+                } else {
+                    cmdSetResult("Modem off failed: %s", modemLastError()[0] ? modemLastError() : "err");
+                }
+            }
+        }
     } else if (strcmp(word, "wfi") == 0) {
         if (arg[0] != '\0') {
             cmdSetResult("wfi (toggle only)");
@@ -1616,15 +1719,15 @@ bool executeCommand(const char* cmd) {
             btSetEnabled(next);
             cmdSetResult("BT %s (%s)", next ? "on" : "off", btStatusShort());
         }
-    } else if (strcmp(word, "gs") == 0) {
+    } else if (strcmp(word, "gs") == 0 || strcmp(word, "gpss") == 0) {
         if (arg[0] != '\0') {
-            cmdSetResult("gs (no args)");
+            cmdSetResult("gs/gpss (no args)");
         } else {
             gnssScanCommand();
         }
-    } else if (strcmp(word, "gnss") == 0) {
+    } else if (strcmp(word, "gps") == 0) {
         if (arg[0] != '\0') {
-            cmdSetResult("gnss (toggle only)");
+            cmdSetResult("gps (toggle only)");
         } else {
             bool next = !gnssIsPowered();
             gnssSetPower(next);
@@ -1633,7 +1736,7 @@ bool executeCommand(const char* cmd) {
             char sats[8];
             if (snap.satellites >= 0) snprintf(sats, sizeof(sats), "%d", snap.satellites);
             else snprintf(sats, sizeof(sats), "-");
-            cmdSetResult("GNSS %s fix:%s sats:%s", next ? "on" : "off", snap.has_fix ? "yes" : "no", sats);
+            cmdSetResult("GPS %s fix:%s sats:%s", next ? "on" : "off", snap.has_fix ? "yes" : "no", sats);
         }
     } else if (strcmp(word, "date") == 0) {
         clockDateCommand();
@@ -1643,9 +1746,17 @@ bool executeCommand(const char* cmd) {
         else if (wifi_state == WIFI_CONNECTING) ws = "...";
         else if (wifi_state == WIFI_FAILED) ws = "fail";
         cmdClearResult();
-        cmdAddLine("WiFi:%s SSH:%s BT:%s", ws, ssh_connected ? "ok" : "off", btStatusShort());
+        cmdAddLine("WiFi:%s 4G:%s SSH:%s BT:%s", ws, modemStatusShort(), ssh_connected ? "ok" : "off", btStatusShort());
         cmdAddLine("BT name:%s", config_bt_name);
         cmdAddLine("BT pair:%s", btIsBonded() ? "bonded" : "unpaired");
+        int csq = modemLastCsq();
+        if (csq >= 0) {
+            if (csq <= 31) cmdAddLine("4G CSQ:%d RSSI:%ddBm", csq, -113 + (2 * csq));
+            else cmdAddLine("4G CSQ:%d", csq);
+        }
+        if (modemLastError()[0] != '\0') {
+            cmdAddLine("4G err:%s", modemLastError());
+        }
         if (wifi_last_fail_ssid[0] != '\0') {
             cmdAddLine("WiFi fail:%s", wifi_last_fail_ssid);
             cmdAddLine("Why:%s", wifi_last_fail_reason);
@@ -1655,7 +1766,7 @@ bool executeCommand(const char* cmd) {
         }
         GnssSnapshot gnss;
         gnssGetSnapshot(&gnss);
-        cmdAddLine("GNSS:%s", gnss.power_on ? "on" : "off");
+        cmdAddLine("GPS:%s", gnss.power_on ? "on" : "off");
         cmdAddLine("Bat:%d%% Heap:%dK", battery_pct, ESP.getFreeHeap() / 1024);
         cmdAddLine("Clock:%s(%s)",
                    timeSyncClockLooksValid() ? "set" : "unset",
@@ -1667,7 +1778,7 @@ bool executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("l/ls e/edit w/save daily r/rm");
         cmdAddLine("u/upload d/download p/paste ssh np dc");
-        cmdAddLine("ws wfi bs bt gnss gs");
+        cmdAddLine("ws wfi bs bt gs/gpss gps mds mdm");
         cmdAddLine("date s/status h/help");
         cmdAddLine("<name> runs /name.x shortcut");
     } else {

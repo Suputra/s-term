@@ -112,3 +112,5 @@ uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"         # returns to n
 ## Guardrails
 - Use debug env for automation unless release/prod validation is requested.
 - Keep automation-only firmware code inside `#if TDECK_AGENT_DEBUG`.
+- Keep `README.md` current whenever behavior, commands, config format, or tooling changes.
+- Keep README prose direct and human-written: avoid AI-style filler/hedging and avoid bloating sections with repeated details.

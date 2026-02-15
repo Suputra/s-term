@@ -26,6 +26,14 @@
 #define BOARD_GPS_RXD       44
 #define BOARD_GPS_PPS       1
 
+#define BOARD_MODEM_POWER_EN 41
+#define BOARD_MODEM_PWRKEY   40
+#define BOARD_MODEM_RST      9
+#define BOARD_MODEM_RXD      10
+#define BOARD_MODEM_TXD      11
+#define BOARD_MODEM_DTR      8
+#define BOARD_MODEM_RI       7
+
 #define BOARD_TOUCH_INT     12
 #define BOARD_TOUCH_RST     45
 

@@ -44,3 +44,5 @@ Keypress-driven examples:
 ## Notes
 - Production build: `pio run -e T-Deck-Pro -t upload` (automation protocol off).
 - Keep automation-only code under `#if TDECK_AGENT_DEBUG`.
+- Keep `README.md` synchronized with current behavior, command set, config format, and test flow.
+- Keep README edits concise and practical; avoid LLM-style phrasing and section bloat.

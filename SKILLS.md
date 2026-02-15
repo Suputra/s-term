@@ -2,6 +2,10 @@
 
 This file defines reusable hardware-debug skills for AI agents working on this repo.
 
+## Documentation Guardrail
+- Keep `README.md` updated whenever firmware behavior, host scripts, command syntax, or config format changes.
+- Prefer concise, concrete edits; avoid LLM-style language and avoid unnecessary growth in README size.
+
 ## `camera-probe`
 Use when camera index selection is unknown or captures are black.
 
