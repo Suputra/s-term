@@ -9,7 +9,7 @@ uv sync
 
 ## Preferred Smoke Test
 ```bash
-pio run -e T-Deck-Pro-debug -t upload
+pio run -e debug -t upload
 uv run scripts/agent_smoke.py --boot-wait 2
 ```
 
@@ -26,7 +26,7 @@ Use a working index (`opened=1`, `frame=1`, non-zero mean/std) as `--camera-sour
 
 ## Manual Scenario Path
 1. Flash debug firmware:
-   `pio run -e T-Deck-Pro-debug -t upload`
+   `pio run -e debug -t upload`
 2. Serial channel check:
    `uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"`
 3. Drive scenario:
@@ -42,7 +42,7 @@ Keypress-driven examples:
 - Generic repeated press: `uv run scripts/tdeck_agent.py "PRESS MIC 2" "WAIT 300" "STATE"`
 
 ## Notes
-- Production build: `pio run -e T-Deck-Pro -t upload` (automation protocol off).
+- Production build: `pio run -t upload` (automation protocol off).
 - Keep automation-only code under `#if TDECK_AGENT_DEBUG`.
 - Keep `README.md` synchronized with current behavior, command set, config format, and test flow.
 - Keep README edits concise and practical; avoid LLM-style phrasing and section bloat.

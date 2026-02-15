@@ -8,10 +8,10 @@ Run a closed hardware loop without manual keypresses:
 4. Decide pass/fail and iterate.
 
 ## Build Modes
-- Production: `pio run -e T-Deck-Pro -t upload`
-- Debug automation: `pio run -e T-Deck-Pro-debug -t upload`
+- Production: `pio run -t upload`
+- Debug automation: `pio run -e debug -t upload`
 
-`T-Deck-Pro-debug` enables `TDECK_AGENT_DEBUG=1` (serial automation protocol).
+`debug` maps to `T-Deck-Pro-debug` and enables `TDECK_AGENT_DEBUG=1` (serial automation protocol).
 Production keeps it disabled to avoid runtime overhead.
 
 ## Required Tools
@@ -27,7 +27,7 @@ uv sync
 Use this when you want a quick write+capture verification:
 
 ```bash
-pio run -e T-Deck-Pro-debug -t upload
+pio run -e debug -t upload
 uv run scripts/agent_smoke.py --boot-wait 2
 ```
 
@@ -61,7 +61,7 @@ Then pass that index via `--camera-source "<idx>"` (or deprecated `--camera-devi
 
 ## Full Canonical Loop
 1. Flash debug firmware:
-   `pio run -e T-Deck-Pro-debug -t upload`
+   `pio run -e debug -t upload`
 2. Smoke-check agent channel:
    `uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"`
 3. Drive scenario over serial commands.

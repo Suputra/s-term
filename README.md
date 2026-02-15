@@ -35,7 +35,7 @@ source scripts/setup-pio.sh
 
 ### 2) Flash production firmware
 ```bash
-pio run -e T-Deck-Pro -t upload
+pio run -t upload
 ```
 
 (Optional serial output)
@@ -229,15 +229,15 @@ SPI bus is shared between e-ink and SD via cooperative `sd_busy` / `display_idle
 
 ## Development
 ### Build modes
-- Production: `pio run -e T-Deck-Pro -t upload`
-- Debug automation: `pio run -e T-Deck-Pro-debug -t upload`
+- Production: `pio run -t upload`
+- Debug automation: `pio run -e debug -t upload`
 
-`T-Deck-Pro-debug` enables `TDECK_AGENT_DEBUG=1` (serial automation protocol).
+`debug` maps to `T-Deck-Pro-debug` and enables `TDECK_AGENT_DEBUG=1` (serial automation protocol).
 Production keeps it disabled.
 
 ### Fast path (write + render + capture)
 ```bash
-pio run -e T-Deck-Pro-debug -t upload
+pio run -e debug -t upload
 uv run scripts/agent_smoke.py --boot-wait 2
 ```
 
@@ -265,7 +265,7 @@ uv run scripts/probe_cameras.py --max-index 5
 Pick an index with `opened=1`, `frame=1`, and non-trivial `mean/std`, then pass `--camera-source "<idx>"`.
 
 ### Full canonical loop
-1. Flash debug firmware: `pio run -e T-Deck-Pro-debug -t upload`
+1. Flash debug firmware: `pio run -e debug -t upload`
 2. Check serial channel: `uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"`
 3. Drive scenario commands over serial
 4. Capture artifacts:

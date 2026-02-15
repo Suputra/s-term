@@ -23,7 +23,7 @@ Use when firmware changes must be tested on-device with automation enabled.
 
 Command:
 ```bash
-pio run -e T-Deck-Pro-debug -t upload
+pio run -e debug -t upload
 ```
 
 Output expectation:
@@ -102,7 +102,7 @@ Use only for production validation or release candidates.
 
 Command:
 ```bash
-pio run -e T-Deck-Pro -t upload
+pio run -t upload
 ```
 
 Constraint:
