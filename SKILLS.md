@@ -58,7 +58,7 @@ Pass criteria:
 
 Constraint:
 - Custom `--marker` should avoid character `0` for now.
-- Default camera source is `http://10.0.44.199:4747/`; override with `--camera-source`.
+- Default camera source is `http://localhost:8100/stream` (camera mux); override with `--camera-source`.
 
 ## `scenario-drive`
 Use to emulate device input and mode transitions without touching hardware keys.

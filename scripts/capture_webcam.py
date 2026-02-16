@@ -14,7 +14,7 @@ except ImportError as exc:  # pragma: no cover - import error path
         "opencv-python is required. Run: uv sync"
     ) from exc
 
-DEFAULT_CAMERA_SOURCE = "http://10.0.44.199:4747/"
+DEFAULT_CAMERA_SOURCE = "http://localhost:8100/stream"
 
 
 def parse_capture_source(source: str) -> int | str:

@@ -4,7 +4,7 @@
 Run a closed hardware loop without manual keypresses:
 1. Flash debug firmware.
 2. Drive input over serial.
-3. Capture screen evidence via camera feed (default: `http://10.0.44.199:4747/`).
+3. Capture screen evidence via camera feed (default: `http://localhost:8100/stream`).
 4. Decide pass/fail and iterate.
 
 ## Build Modes
@@ -104,7 +104,7 @@ uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"         # returns to n
 
 ## Troubleshooting
 - `AGENT ERR`: treat as scenario failure; fix command or firmware behavior.
-- Camera opened but frame is black: verify IP stream URL, or for local webcam use `scripts/probe_cameras.py` and switch `--camera-source`; increase `--warmup`.
+- Camera opened but frame is black: check mux health (`curl localhost:8100/health`), verify IP stream URL, or for local webcam use `scripts/probe_cameras.py` and switch `--camera-source`; increase `--warmup`.
 - `TEXT` fails due to active modifier mode: use explicit `KEY`/`PRESS` commands first.
 - `TEXT` fails on marker character `0`: use marker text without `0` or type `0` via key-level commands.
 - Need release validation: flash production env and rerun manual or non-agent checks.

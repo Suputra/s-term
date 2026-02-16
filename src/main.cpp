@@ -59,6 +59,8 @@ static char   config_vpn_endpoint[64] = "";
 static int    config_vpn_port        = 51820;
 static char   config_vpn_dns[32]     = "";
 static char   config_time_tz[64]     = "UTC0";
+static char   config_msh_channel[32] = "";
+static char   config_msh_psk[96]     = "";
 static WireGuard wg;
 static bool   vpn_connected = false;
 static bool vpnConfigured() { return config_vpn_privkey[0] != '\0'; }
@@ -1096,7 +1098,8 @@ void sdLoadConfig() {
     // # vpn — ENABLE, privkey, pubkey, psk, ip, endpoint, port, [optional dns]
     // # bt   — optional BLE settings ([optional enable], name, [optional 6-digit pin])
     // # time — optional timezone (POSIX TZ string), e.g. PST8PDT,M3.2.0,M11.1.0
-    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT, SEC_TIME } section = SEC_WIFI;
+    // # msh  — optional channel config (line1=name, line2=key spec)
+    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT, SEC_TIME, SEC_MSH } section = SEC_WIFI;
     int field = 0;  // field index within current section
     bool wifi_expect_ssid = true;
     char wifi_ssid[64] = "";
@@ -1160,6 +1163,9 @@ void sdLoadConfig() {
                 field = 0;
             } else if (line.indexOf("time") >= 0) {
                 section = SEC_TIME;
+                field = 0;
+            } else if (line.indexOf("msh") >= 0 || line.indexOf("meshtastic") >= 0) {
+                section = SEC_MSH;
                 field = 0;
             }
             continue;
@@ -1270,17 +1276,48 @@ void sdLoadConfig() {
                 SERIAL_LOGF("SD: timezone set: %s\n", config_time_tz);
             }
             field++;
+        } else if (section == SEC_MSH) {
+            String lowered = line;
+            lowered.toLowerCase();
+
+            if (lowered.startsWith("name=")) {
+                String value = line.substring(5);
+                value.trim();
+                strncpy(config_msh_channel, value.c_str(), sizeof(config_msh_channel) - 1);
+                config_msh_channel[sizeof(config_msh_channel) - 1] = '\0';
+                field = 1;
+                continue;
+            }
+            if (lowered.startsWith("psk=") || lowered.startsWith("key=")) {
+                int eq = line.indexOf('=');
+                String value = (eq >= 0) ? line.substring(eq + 1) : "";
+                value.trim();
+                strncpy(config_msh_psk, value.c_str(), sizeof(config_msh_psk) - 1);
+                config_msh_psk[sizeof(config_msh_psk) - 1] = '\0';
+                field = 2;
+                continue;
+            }
+
+            if (field == 0) {
+                strncpy(config_msh_channel, line.c_str(), sizeof(config_msh_channel) - 1);
+                config_msh_channel[sizeof(config_msh_channel) - 1] = '\0';
+            } else if (field == 1) {
+                strncpy(config_msh_psk, line.c_str(), sizeof(config_msh_psk) - 1);
+                config_msh_psk[sizeof(config_msh_psk) - 1] = '\0';
+            }
+            field++;
         }
     }
     flushPendingOpenWiFi();
     f.close();
-    SERIAL_LOGF("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=%s, BT name=%s, TZ=%s)\n",
+    SERIAL_LOGF("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=%s, BT name=%s, TZ=%s, MSH=%s)\n",
                   config_wifi_count,
                   config_ssh_host,
                   vpnConfigured() ? "yes" : "no",
                   config_bt_enabled ? "on" : "off",
                   config_bt_name,
-                  config_time_tz);
+                  config_time_tz,
+                  config_msh_channel[0] ? config_msh_channel : "(default)");
 }
 
 // --- File I/O Helpers ---
@@ -1591,6 +1628,7 @@ void autoSaveDirty() {
 #include "network_module.hpp"
 #include "gnss_module.hpp"
 #include "modem_module.hpp"
+#include "meshtastic_module.hpp"
 #include "bluetooth_module.hpp"
 #include "screen_module.hpp"
 #include "keyboard_module.hpp"
@@ -1842,6 +1880,15 @@ void setup() {
     timeSyncSetTimeZone(config_time_tz);
     gnssInit();
     modemInit();
+    meshtasticInit();
+    if (config_msh_channel[0] != '\0' || config_msh_psk[0] != '\0') {
+        if (!meshtasticConfigureChannel(config_msh_channel[0] ? config_msh_channel : NULL,
+                                        config_msh_psk[0] ? config_msh_psk : NULL)) {
+            SERIAL_LOGF("MSH: config apply failed: %s\n", meshtasticLastError());
+        } else {
+            SERIAL_LOGF("MSH: config applied (channel=%s)\n", config_msh_channel[0] ? config_msh_channel : "LongFast");
+        }
+    }
     btInit();
     updateBattery();  // Seed battery_pct before the first status bar render.
 
@@ -1875,6 +1922,8 @@ void loop() {
     wifiScanPoll();
     btScanPoll();
     gnssScanPoll();
+    meshtasticScanPoll();
+    meshtasticPoll();
     modemScanPoll();
     modemPowerNotifyPoll();
     gnssPoll();

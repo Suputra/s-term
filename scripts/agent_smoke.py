@@ -17,7 +17,7 @@ except ImportError as exc:  # pragma: no cover - import error path
 
 
 STATE_RE = re.compile(r"AGENT OK STATE .*text_len=(\d+)")
-DEFAULT_CAMERA_SOURCE = "http://10.0.44.199:4747/"
+DEFAULT_CAMERA_SOURCE = "http://localhost:8100/stream"
 
 
 def run_command(cmd: list[str]) -> str:

@@ -14,6 +14,8 @@
 
 #define BOARD_LORA_CS       3
 #define BOARD_LORA_RST      4
+#define BOARD_LORA_DIO1     5
+#define BOARD_LORA_BUSY     6
 #define BOARD_SD_CS         48
 
 #define BOARD_KEYBOARD_INT  15

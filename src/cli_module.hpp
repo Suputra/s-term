@@ -36,10 +36,13 @@ static char shortcut_pending_name[SHORTCUT_NAME_MAX] = "";
 static bool wifi_scan_pending = false;
 static bool bt_scan_pending = false;
 static bool gnss_scan_pending = false;
+static bool meshtastic_scan_pending = false;
 static bool modem_scan_pending = false;
 static bool modem_power_pending_notice = false;
 static uint32_t gnss_scan_started_ms = 0;
+static uint32_t meshtastic_scan_started_ms = 0;
 static constexpr uint32_t GNSS_SCAN_DWELL_MS = 2000;
+static constexpr uint32_t MESHTASTIC_SCAN_DWELL_MS = 250;
 static constexpr uint32_t MODEM_SCAN_DWELL_MS = MODEM_SCAN_DEFAULT_DWELL_MS;
 
 void finishWifiScanCommand() {
@@ -1425,6 +1428,8 @@ void powerOff() {
 
     // Stop BLE advertising/connection before sleeping.
     btShutdown();
+    if (gnssIsPowered()) gnssSetPower(false);
+    if (meshtasticIsPowered()) meshtasticSetPowered(false);
     if (modemIsPowered()) modemSetPowered(false);
 
     // Stop shared buses before sleeping.
@@ -1605,6 +1610,131 @@ void gnssScanCommand() {
     gnss_scan_pending = true;
     gnss_scan_started_ms = millis();
     cmdSetResult("Scanning GPS...");
+}
+
+void finishMeshtasticScanCommand() {
+    MeshtasticScanResult snap;
+    if (!meshtasticScanStatus(&snap)) {
+        meshtastic_scan_pending = false;
+        cmdSetResult("MSS failed");
+        render_requested = true;
+        return;
+    }
+    meshtastic_scan_pending = false;
+
+    cmdClearResult();
+    cmdAddLine("MSS:%s %lums", snap.ok ? "ok" : "fail", (unsigned long)snap.elapsed_ms);
+    cmdAddLine("MSH:%s%s mesh:%s",
+               snap.powered_before ? "on" : "off",
+               snap.temporary_power ? " (temp)" : "",
+               snap.mesh_ready ? "yes" : "no");
+
+    if (snap.has_packet_type) {
+        cmdAddLine("Packet:%s(0x%02X)", meshtasticPacketTypeName(snap.packet_type), snap.packet_type);
+    } else {
+        cmdAddLine("Packet:-");
+    }
+
+    if (snap.has_status) cmdAddLine("Status:0x%02X", snap.status);
+    else cmdAddLine("Status:-");
+
+    if (snap.has_device_errors) cmdAddLine("Err:0x%04X", snap.device_errors);
+    else cmdAddLine("Err:-");
+
+    MeshtasticSnapshot state;
+    meshtasticGetSnapshot(&state);
+    cmdAddLine("Node:!%08lX ch:%lu h:0x%02X",
+               (unsigned long)state.node_num,
+               (unsigned long)state.channel_num + 1UL,
+               state.channel_hash);
+    cmdAddLine("Freq:%.3fMHz %s", (double)state.freq_mhz, state.channel_name);
+    cmdAddLine("RX:%lu txt:%lu dup:%lu bad:%lu crc:%lu",
+               (unsigned long)state.rx_packets,
+               (unsigned long)state.rx_text_packets,
+               (unsigned long)state.rx_duplicates,
+               (unsigned long)state.rx_decode_failures,
+               (unsigned long)state.rx_crc_errors);
+    cmdAddLine("TX:%lu fail:%lu",
+               (unsigned long)state.tx_packets,
+               (unsigned long)state.tx_failures);
+    if (state.has_last_text) {
+        cmdAddLine("Last:!%08lX %s",
+                   (unsigned long)state.last_rx_from,
+                   state.last_text);
+    }
+    cmdAddLine("Scans:%lu fail:%lu",
+               (unsigned long)state.scan_count,
+               (unsigned long)state.scan_fail_count);
+    if (!snap.ok && snap.error[0] != '\0') cmdAddLine("Why:%s", snap.error);
+    render_requested = true;
+}
+
+void meshtasticScanPoll() {
+    if (!meshtastic_scan_pending) return;
+    if ((uint32_t)(millis() - meshtastic_scan_started_ms) < MESHTASTIC_SCAN_DWELL_MS) return;
+    finishMeshtasticScanCommand();
+}
+
+void meshtasticScanCommand() {
+    if (meshtastic_scan_pending) {
+        cmdSetResult("MSH scan already running");
+        return;
+    }
+    meshtastic_scan_pending = true;
+    meshtastic_scan_started_ms = millis();
+    cmdSetResult("Scanning MSH...");
+}
+
+void meshtasticSendTextCommand(const char* text) {
+    if (!text || text[0] == '\0') {
+        cmdSetResult("mss tx <text> | mss tx !<node> <text>");
+        return;
+    }
+    if (meshtastic_scan_pending) {
+        cmdSetResult("MSH scan running");
+        return;
+    }
+    if (!meshtasticIsPowered()) {
+        cmdSetResult("MSH off (use msh)");
+        return;
+    }
+
+    const char* payload = text;
+    while (*payload == ' ') payload++;
+    if (*payload == '\0') {
+        cmdSetResult("mss tx <text> | mss tx !<node> <text>");
+        return;
+    }
+
+    uint32_t to_node = MSH_NODENUM_BROADCAST;
+    bool want_ack = false;
+    if (*payload == '!') {
+        char* endptr = NULL;
+        unsigned long parsed = strtoul(payload + 1, &endptr, 16);
+        bool looks_direct = (endptr != payload + 1) && (parsed > 0) && (parsed <= 0xFFFFFFFFUL) &&
+                            endptr && (*endptr == ' ');
+        if (looks_direct) {
+            while (*endptr == ' ') endptr++;
+            if (*endptr == '\0') {
+                cmdSetResult("mss tx !<node> <text>");
+                return;
+            }
+            to_node = (uint32_t)parsed;
+            want_ack = true;
+            payload = endptr;
+        }
+    }
+
+    uint32_t packet_id = 0;
+    if (meshtasticSendTextTo(payload, to_node, want_ack, MSH_DEFAULT_HOP_LIMIT, &packet_id)) {
+        if (to_node == MSH_NODENUM_BROADCAST) {
+            cmdSetResult("MSH tx ok id:%08lX", (unsigned long)packet_id);
+        } else {
+            cmdSetResult("MSH tx ok !%08lX id:%08lX", (unsigned long)to_node, (unsigned long)packet_id);
+        }
+    } else {
+        cmdSetResult("MSH tx failed: %s", meshtasticLastError()[0] ? meshtasticLastError() : "err");
+    }
 }
 
 void finishModemScanCommand() {
@@ -1939,6 +2069,30 @@ bool executeCommand(const char* cmd) {
             else snprintf(sats, sizeof(sats), "-");
             cmdSetResult("GPS %s fix:%s sats:%s", next ? "on" : "off", snap.has_fix ? "yes" : "no", sats);
         }
+    } else if (strcmp(word, "mss") == 0) {
+        if (arg[0] == '\0') {
+            meshtasticScanCommand();
+        } else if (strncmp(arg, "tx ", 3) == 0 && arg[3] != '\0') {
+            meshtasticSendTextCommand(arg + 3);
+        } else {
+            cmdSetResult("mss | mss tx <text> | mss tx !<node> <text>");
+        }
+    } else if (strcmp(word, "msh") == 0) {
+        if (arg[0] != '\0') {
+            cmdSetResult("msh (toggle only)");
+        } else if (meshtastic_scan_pending) {
+            cmdSetResult("MSH scan running");
+        } else {
+            bool next = !meshtasticIsPowered();
+            bool changed = meshtasticSetPowered(next);
+            if (next) {
+                if (changed || meshtasticIsPowered()) cmdSetResult("MSH on");
+                else cmdSetResult("MSH on failed: %s", meshtasticLastError()[0] ? meshtasticLastError() : "err");
+            } else {
+                if (changed || !meshtasticIsPowered()) cmdSetResult("MSH off");
+                else cmdSetResult("MSH off failed: %s", meshtasticLastError()[0] ? meshtasticLastError() : "err");
+            }
+        }
     } else if (strcmp(word, "date") == 0) {
         clockDateCommand();
     } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
@@ -1950,6 +2104,17 @@ bool executeCommand(const char* cmd) {
         cmdAddLine("WiFi:%s 4G:%s SSH:%s BT:%s", ws, modemStatusShort(), ssh_connected ? "ok" : "off", btStatusShort());
         cmdAddLine("BT name:%s", config_bt_name);
         cmdAddLine("BT pair:%s", btIsBonded() ? "bonded" : "unpaired");
+        MeshtasticSnapshot msh;
+        meshtasticGetSnapshot(&msh);
+        char msh_pkt[12];
+        char msh_err[12];
+        snprintf(msh_pkt, sizeof(msh_pkt), "%s", msh.has_packet_type ? meshtasticPacketTypeName(msh.packet_type) : "-");
+        if (msh.has_device_errors) snprintf(msh_err, sizeof(msh_err), "0x%04X", msh.device_errors);
+        else snprintf(msh_err, sizeof(msh_err), "-");
+        cmdAddLine("MSH:%s pkt:%s err:%s", meshtasticStatusShort(), msh_pkt, msh_err);
+        if (msh.last_error[0] != '\0') {
+            cmdAddLine("MSH why:%s", msh.last_error);
+        }
         int csq = modemLastCsq();
         if (csq >= 0) {
             if (csq <= 31) cmdAddLine("4G CSQ:%d RSSI:%ddBm", csq, -113 + (2 * csq));
@@ -1979,7 +2144,8 @@ bool executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("l/ls e/edit w/save daily r/rm");
         cmdAddLine("u/upload d/download p/paste ssh np dc");
-        cmdAddLine("ws wfi bs bt gs/gpss gps mds mdm");
+        cmdAddLine("ws wfi bs bt gs/gpss gps mds mdm msh mss");
+        cmdAddLine("mss tx <text> / !<node> <text>");
         cmdAddLine("date s/status h/help");
         cmdAddLine("<name> runs /name.x shortcut");
     } else {

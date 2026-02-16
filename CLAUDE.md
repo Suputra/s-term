@@ -15,7 +15,7 @@ uv run scripts/agent_smoke.py --boot-wait 2
 
 `agent_smoke.py` performs write + render + capture + basic checks and prints `PASS`/`FAIL`.
 Use `--marker` without `0` if you need a custom marker.
-Default camera source is `http://10.0.44.199:4747/`.
+Default camera source is `http://localhost:8100/stream`.
 
 ## If Camera Selection Is Wrong
 ```bash
@@ -40,6 +40,12 @@ Keypress-driven examples:
 - Open terminal (SSH attempt path): `uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"`
 - Return to notepad: `uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"`
 - Generic repeated press: `uv run scripts/tdeck_agent.py "PRESS MIC 2" "WAIT 300" "STATE"`
+
+## Camera Mux
+Default camera source is `localhost:8100` (persistent MJPEG relay for DroidCam).
+- Setup: `bash ~/camera/install.sh`
+- Health check: `curl localhost:8100/health`
+- Logs: `journalctl --user -u camera-mux -f`
 
 ## Notes
 - Production build: `pio run -t upload` (automation protocol off).

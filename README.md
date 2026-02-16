@@ -1,6 +1,6 @@
 # T-Deck Pro Notepad
 
-Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, optional WireGuard fallback, and optional BLE/GPS/4G features.
+Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, optional WireGuard fallback, and optional BLE/GPS/4G/Meshtastic-radio features.
 
 ## Overview
 - Default mode is a keyboard-driven notepad rendered on the e-ink panel.
@@ -53,7 +53,7 @@ Type in notepad mode. Single-tap `MIC` to open command mode. Use `h` for command
 For debug automation and camera capture flow, see `Development` at the bottom.
 
 ## SD Card Configuration (`/CONFIG`)
-`/CONFIG` is section-based. Section lines start with `#` and include one of: `wifi`, `ssh`, `vpn`, `bt`, `time`.
+`/CONFIG` is section-based. Section lines start with `#` and include one of: `wifi`, `ssh`, `vpn`, `bt`, `time`, `msh`.
 
 Example:
 
@@ -89,6 +89,10 @@ TDeck-Pro
 
 # time
 PST8PDT,M3.2.0,M11.1.0
+
+# msh
+LongFast
+default
 ```
 
 Notes:
@@ -98,6 +102,7 @@ Notes:
 - `# bt`: parsed in order as optional boot-state token (`enable`/`on`/`true`/`1` or `disable`/`off`/`false`/`0`), optional device name, optional 6-digit passkey.
 - If `# bt` is missing, Bluetooth stays off at boot. Runtime control is the `bt` command (toggle only).
 - If `# time` is missing, timezone defaults to `UTC0`.
+- `# msh`: optional Meshtastic channel config (`line1=channel name`, `line2=key spec`). Key spec supports `default`, `none`, decimal index (`1` = default public key), `hex:<...>`, or `base64:<...>`.
 
 ## Usage
 ### Notepad (default mode)
@@ -120,6 +125,15 @@ Bluetooth is runtime-toggleable from command mode:
 - `bs`: scan nearby BLE devices
 
 Advertising is not kept alive indefinitely (times out to idle) to reduce unwanted wakeups.
+
+### Meshtastic radio control
+Meshtastic/Lora radio power is runtime-toggleable from command mode.
+When powered on, firmware uses Meshtastic-compatible packet format/encryption for the configured channel (default: public LongFast/default key).
+
+- `msh`: toggle radio power on/off
+- `mss`: run a quick radio + mesh status scan
+- `mss tx <text>`: send a broadcast Meshtastic text packet
+- `mss tx !<node> <text>`: send a direct Meshtastic text packet (request ACK)
 
 ### Command Processor
 Single-tap `MIC` from any mode to open command mode (bottom half of screen).
@@ -146,8 +160,12 @@ Touch arrows in command mode browse command history. In file-picker mode: Up/Dow
 | `bt` | Toggle Bluetooth on/off |
 | `gps` | Toggle GPS on/off |
 | `gs` / `gpss` | GPS detail scan (non-blocking) |
+| `mss` | Meshtastic radio/mesh status scan (non-blocking) |
+| `mss tx <text>` | Send Meshtastic broadcast text |
+| `mss tx !<node> <text>` | Send direct Meshtastic text (ACK requested) |
+| `msh` | Toggle Meshtastic radio power |
 | `date` | Show local date/time and sync source |
-| `s` / `status` | Show WiFi/4G/SSH/BT/GPS/battery/clock status |
+| `s` / `status` | Show WiFi/4G/SSH/BT/GPS/MSH/battery/clock status |
 | `h` / `help` | Show help |
 | `<name>` or `<name>.x` | Run shortcut script from `/<name>.x` |
 
@@ -210,6 +228,7 @@ Major firmware components are split into flat module headers in `src/`:
 
 - `src/network_module.hpp` (WiFi, SSH, VPN connectivity)
 - `src/modem_module.hpp` (A7682E modem power + LTE scan helpers)
+- `src/meshtastic_module.hpp` (SX126x power control + Meshtastic-compatible RX/TX/status)
 - `src/bluetooth_module.hpp` (BLE peripheral, pairing/bonding, runtime toggle)
 - `src/screen_module.hpp` (display rendering/task logic)
 - `src/keyboard_module.hpp` (keyboard input + mode handlers)
