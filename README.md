@@ -1,12 +1,12 @@
 # s-term
 
-Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, optional WireGuard fallback, and optional BLE/GPS/4G/Meshtastic-radio features.
+Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, WireGuard support, and BLE/GPS/4G/Meshtastic-radio features.
 
 ## Overview
-- Default mode is a keyboard-driven notepad rendered on the e-ink panel.
+- Default mode is a keyboard-driven notepad rendered on the e-ink panel. Files can be saved to the SD card.
 - `ssh` switches to terminal mode (WiFi first, then VPN fallback when configured).
 - Files live on SD root and can be edited/saved on-device or transferred with SCP mirror sync (`upload` / `download`).
-- Bluetooth mode is a BLE peripheral service (not a HID keyboard), so phones keep their on-screen keyboard.
+- Bluetooth mode is a BLE peripheral service.
 
 ## Quickstart
 ### 1) Install tools
@@ -61,30 +61,30 @@ Example:
 # wifi
 home_ssid
 home_password
+
 office_guest_open
 
 phone_hotspot
 hotspot_password
 
 # ssh
-10.0.0.100
-22
+ssh_ip_address/host
+ssh_port (usually 222)
 user
 password
-10.207.162.10
+fallback_ip
 
 # vpn
-<device_private_key_base64>
-<server_public_key_base64>
-<preshared_key_base64>
-<device_vpn_ip>
-<endpoint_host_or_ip>
-51820
-10.0.0.1
+device_private_key_base64
+server_public_key_base64
+preshared_key_base64
+device_vpn_ip
+endpoint_host_or_ip
+port (usually 51820)
+DNS
 
 # bt
-enable
-TDeck-Pro
+s-term
 123456
 
 # time
@@ -99,7 +99,7 @@ Notes:
 - `# wifi`: lines are SSID/password pairs. If password is blank (or section ends right after SSID), that AP is treated as open.
 - `# ssh`: host, port, user, password, optional VPN-only host override.
 - `# vpn`: private key, server pubkey, PSK, local VPN IP, endpoint, port, optional DNS.
-- `# bt`: parsed in order as optional boot-state token (`enable`/`on`/`true`/`1` or `disable`/`off`/`false`/`0`), optional device name, optional 6-digit passkey.
+- `# bt`: optional device name, optional 6-digit passkey.
 - If `# bt` is missing, Bluetooth stays off at boot. Runtime control is the `bt` command (toggle only).
 - If `# time` is missing, timezone defaults to `UTC0`.
 - `# msh`: optional Meshtastic channel config (`line1=channel name`, `line2=key spec`). Key spec supports `default`, `none`, decimal index (`1` = default public key), `hex:<...>`, or `base64:<...>`.
