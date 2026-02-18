@@ -1501,7 +1501,11 @@ bool ensureClockForDateDaily() {
 
 void wifiToggleCommand() {
     wifi_mode_t mode = WiFi.getMode();
-    bool wifi_enabled = (mode != WIFI_OFF) || wifi_state == WIFI_CONNECTED || wifi_state == WIFI_CONNECTING;
+    // WIFI_STA mode lingers after a scan (ws) but doesn't mean WiFi is in use.
+    // Use wifi_state as source of truth; only treat hardware-level WIFI_STA as active
+    // when we haven't already decided it's idle or failed.
+    bool wifi_enabled = (mode != WIFI_OFF && wifi_state != WIFI_IDLE && wifi_state != WIFI_FAILED) ||
+                        wifi_state == WIFI_CONNECTED || wifi_state == WIFI_CONNECTING;
 
     if (wifi_enabled) {
         if (ssh_connected || ssh_connecting) {

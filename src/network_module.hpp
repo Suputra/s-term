@@ -74,15 +74,21 @@ WiFiAttemptResult wifiTryAP(const char* ssid, const char* pass, int timeout_ms) 
     vTaskDelay(pdMS_TO_TICKS(50));
     if (pass && pass[0] != '\0') WiFi.begin(ssid, pass);
     else                         WiFi.begin(ssid);
+    // After scanDelete() the driver re-scans fresh on begin(), which takes 1-3 s.
+    // Don't bail on WL_NO_SSID_AVAIL until we've given it at least 3 s to scan.
+    static constexpr int SSID_NOT_FOUND_MIN_MS = 3000;
     int elapsed = 0;
     while (elapsed < timeout_ms) {
-        wl_status_t st = WiFi.status();
-        if (st == WL_CONNECTED) return { true, st, false };
-        if (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED || st == WL_CONNECTION_LOST) {
-            return { false, st, false };
-        }
         vTaskDelay(pdMS_TO_TICKS(250));
         elapsed += 250;
+        wl_status_t st = WiFi.status();
+        if (st == WL_CONNECTED) return { true, st, false };
+        if (st == WL_CONNECT_FAILED || st == WL_CONNECTION_LOST) {
+            return { false, st, false };
+        }
+        if (st == WL_NO_SSID_AVAIL && elapsed >= SSID_NOT_FOUND_MIN_MS) {
+            return { false, st, false };
+        }
     }
     wl_status_t final_status = WiFi.status();
     return { final_status == WL_CONNECTED, final_status, true };
