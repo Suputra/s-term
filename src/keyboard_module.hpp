@@ -177,3 +177,56 @@ bool handleTerminalKeyPress(int event_code) {
 
     return false;
 }
+
+// --- Bluetooth HID Key Handler ---
+
+bool handleBluetoothKeyPress(int event_code) {
+    int key_num = (event_code & 0x7F);
+    int idx = key_num - 1;
+    int row = idx / KEYPAD_COLS;
+    int col_raw = idx % KEYPAD_COLS;
+    int col_rev = (KEYPAD_COLS - 1) - col_raw;
+
+    if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
+
+    if (IS_SHIFT(row, col_rev))  { shift_held = !shift_held; return false; }
+    if (IS_SYM(row, col_rev))    { sym_mode = true; return false; }
+    if (IS_ALT(row, col_rev))    { alt_mode = !alt_mode; return false; }
+    if (IS_MIC(row, col_rev))    {
+        if (sym_mode) { sym_mode = false; btTypeChar('0', 0); return false; }
+        mic_last_press = millis();
+        return false;
+    }
+    if (IS_DEAD(row, col_rev))   { return false; }
+
+    // Alt = Ctrl modifier for the next key.
+    if (alt_mode) {
+        char base = keymap_lower[row][col_rev];
+        if (base == ' ')  { btSendUsage(0x29, 0); alt_mode = false; return false; } // Esc
+        if (base == '\n') { btSendUsage(0x2B, 0); alt_mode = false; return false; } // Tab
+        if (base == '\b') { btSendUsage(0x2A, 0); alt_mode = false; return false; } // Backspace
+        if (base >= 'a' && base <= 'z') {
+            uint8_t usage = (uint8_t)(0x04 + (base - 'a'));
+            btSendUsage(usage, KEY_CTRL);
+            alt_mode = false;
+            return false;
+        }
+        return false;
+    }
+
+    char c;
+    if (sym_mode)        { c = keymap_sym[row][col_rev]; sym_mode = false; }
+    else if (shift_held) c = keymap_upper[row][col_rev];
+    else                 c = keymap_lower[row][col_rev];
+
+    if (c == 0) return false;
+
+    if (c == '\b') { btSendUsage(0x2A, 0); return false; }
+    if (c == '\n') { btSendUsage(0x28, 0); return false; }
+
+    if (c >= ' ' && c <= '~') {
+        btTypeChar(c, 0);
+        if (shift_held) shift_held = false;
+    }
+    return false;
+}

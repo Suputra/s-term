@@ -23,6 +23,7 @@ static const char* agentModeName(AppMode mode) {
         case MODE_NOTEPAD:  return "notepad";
         case MODE_TERMINAL: return "terminal";
         case MODE_COMMAND:  return "command";
+        case MODE_BT:       return "bt";
         default:            return "unknown";
     }
 }
@@ -54,14 +55,16 @@ static bool agentDispatchEventLocked(int event_code) {
         needs_render = handleNotepadKeyPress(event_code);
     } else if (mode == MODE_TERMINAL) {
         needs_render = handleTerminalKeyPress(event_code);
+    } else if (mode == MODE_BT) {
+        needs_render = handleBluetoothKeyPress(event_code);
     } else if (mode == MODE_COMMAND) {
         needs_render = handleCommandKeyPress(event_code);
     }
 
     if (needs_render) {
         AppMode cur = app_mode;
-        if (cur == MODE_NOTEPAD || cur == MODE_COMMAND) render_requested = true;
-        else term_render_requested = true;
+        if (cur == MODE_TERMINAL) term_render_requested = true;
+        else render_requested = true;
     }
     return true;
 }
@@ -127,7 +130,7 @@ static bool agentTypeOneCharLocked(char c, const char** err) {
         if (err) *err = "TAB requires explicit key combos in this firmware";
         return false;
     }
-    if (alt_mode && app_mode == MODE_TERMINAL) {
+    if (alt_mode && (app_mode == MODE_TERMINAL || app_mode == MODE_BT)) {
         if (err) *err = "disable ALT before TEXT";
         return false;
     }
@@ -680,8 +683,8 @@ static void agentRunCommand(char* line) {
             agentReplyErr("busy: state lock timeout");
             return;
         }
-        if (app_mode == MODE_NOTEPAD || app_mode == MODE_COMMAND) render_requested = true;
-        else term_render_requested = true;
+        if (app_mode == MODE_TERMINAL) term_render_requested = true;
+        else render_requested = true;
         agentReplyOk("CMD %s", arg);
         xSemaphoreGive(state_mutex);
         return;

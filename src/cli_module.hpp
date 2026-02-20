@@ -2051,8 +2051,25 @@ bool executeCommand(const char* cmd) {
             cmdSetResult("bt (toggle only)");
         } else {
             bool next = !btIsEnabled();
-            btSetEnabled(next);
-            cmdSetResult("BT %s (%s)", next ? "on" : "off", btStatusShort());
+            if (next) {
+                if (!btSetEnabled(true) || !btIsEnabled()) {
+                    cmdSetResult("BT on failed (%s)", btStatusShort());
+                } else {
+                    shift_held = false;
+                    sym_mode = false;
+                    alt_mode = false;
+                    app_mode = MODE_BT;
+                    cmdSetResult("BT on (%s)", btStatusShort());
+                }
+            } else {
+                btSetEnabled(false);
+                shift_held = false;
+                sym_mode = false;
+                alt_mode = false;
+                cmd_return_mode = MODE_NOTEPAD;
+                app_mode = MODE_NOTEPAD;
+                cmdSetResult("BT off");
+            }
         }
     } else if (strcmp(word, "gs") == 0 || strcmp(word, "gpss") == 0) {
         if (arg[0] != '\0') {

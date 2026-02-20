@@ -48,7 +48,6 @@ static char config_ssh_pass[64]   = "";
 // --- Bluetooth Config (loaded from SD /CONFIG) ---
 static bool     config_bt_enabled = false;
 static char     config_bt_name[32] = "TDeck-Pro";
-static uint32_t config_bt_passkey = 0; // 6-digit optional static PIN
 
 // --- VPN Config (loaded from SD /CONFIG) ---
 static char   config_vpn_privkey[64] = "";
@@ -116,6 +115,8 @@ static constexpr unsigned long TOUCH_TAP_MAX_MS = 300;
 static constexpr int16_t TOUCH_TAP_DEADZONE_X = SCREEN_W / 8;
 static constexpr int16_t TOUCH_TAP_DEADZONE_Y = (SCREEN_H - STATUS_H) / 8;
 static constexpr int TOUCH_SCROLL_MAX_STEPS_PER_POLL = 3;
+static constexpr int16_t BT_TOUCH_TAP_MOVE_MAX = 10;
+static constexpr int BT_TOUCH_MOVE_DIVISOR = 2;
 
 // Read 7 bytes from CST226SE register 0xD000 (touch data report)
 // Returns: 1=touched (x/y set), 0=not touched, -1=I2C failure
@@ -148,7 +149,7 @@ static int cst226ReadTouch(int16_t* x, int16_t* y) {
 
 // --- App Mode ---
 
-enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_COMMAND };
+enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_COMMAND, MODE_BT };
 static volatile AppMode app_mode = MODE_NOTEPAD;
 
 // --- Editor State (shared between cores, protected by mutex) ---
@@ -1124,20 +1125,6 @@ void sdLoadConfig() {
         }
     };
 
-    auto parseBtPasskey = [&](const String& value, uint32_t* out) -> bool {
-        if (!out) return false;
-        if (value.length() != 6) return false;
-        uint32_t pin = 0;
-        for (size_t i = 0; i < 6; i++) {
-            char c = value.charAt(i);
-            if (c < '0' || c > '9') return false;
-            pin = pin * 10 + (uint32_t)(c - '0');
-        }
-        if (pin < 100000 || pin > 999999) return false;
-        *out = pin;
-        return true;
-    };
-
     auto setBtName = [&](const String& value) {
         if (value.length() == 0) return;
         strncpy(config_bt_name, value.c_str(), sizeof(config_bt_name) - 1);
@@ -1241,30 +1228,25 @@ void sdLoadConfig() {
             field++;
         } else if (section == SEC_BT) {
             // Strict positional parsing:
-            // line 1 (optional): ENABLE/ON/TRUE/1
-            // line 2: device name
-            // line 3 (optional): 6-digit passkey
+            // line 1: device name
+            // line 2+ (optional): legacy lines ignored
+            // Note: runtime always starts with BT off; enable/passkey flags are ignored.
             if (field == 0) {
                 String lowered = line;
                 lowered.toLowerCase();
                 if (lowered == "enable" || lowered == "enabled" || lowered == "on" || lowered == "true" || lowered == "1") {
-                    config_bt_enabled = true;
+                    SERIAL_LOGLN("SD: BT enable flag ignored (runtime toggle only)");
                     continue;
                 }
                 if (lowered == "disable" || lowered == "disabled" || lowered == "off" || lowered == "false" || lowered == "0") {
-                    config_bt_enabled = false;
+                    SERIAL_LOGLN("SD: BT disable flag ignored (runtime toggle only)");
                     continue;
                 }
                 setBtName(line);
                 field = 1;
                 continue;
             } else if (field == 1) {
-                uint32_t parsed = 0;
-                if (parseBtPasskey(line, &parsed)) {
-                    config_bt_passkey = parsed;
-                } else {
-                    SERIAL_LOGF("SD: BT pin ignored (need 6 digits): %s\n", line.c_str());
-                }
+                SERIAL_LOGF("SD: BT legacy line ignored: %s\n", line.c_str());
                 field++;
                 continue;
             }
@@ -1310,11 +1292,10 @@ void sdLoadConfig() {
     }
     flushPendingOpenWiFi();
     f.close();
-    SERIAL_LOGF("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=%s, BT name=%s, TZ=%s, MSH=%s)\n",
+    SERIAL_LOGF("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=runtime, BT name=%s, TZ=%s, MSH=%s)\n",
                   config_wifi_count,
                   config_ssh_host,
                   vpnConfigured() ? "yes" : "no",
-                  config_bt_enabled ? "on" : "off",
                   config_bt_name,
                   config_time_tz,
                   config_msh_channel[0] ? config_msh_channel : "(default)");
@@ -1682,6 +1663,31 @@ static void terminalSendArrowKey(TouchTapArrow arrow) {
     }
 }
 
+static void btSendArrowKey(TouchTapArrow arrow) {
+    switch (arrow) {
+        case TOUCH_TAP_ARROW_UP:    btSendUsage(0x52, 0); break;
+        case TOUCH_TAP_ARROW_DOWN:  btSendUsage(0x51, 0); break;
+        case TOUCH_TAP_ARROW_RIGHT: btSendUsage(0x4F, 0); break;
+        case TOUCH_TAP_ARROW_LEFT:  btSendUsage(0x50, 0); break;
+        default: break;
+    }
+}
+
+static int8_t btClampMouseDelta(int value) {
+    if (value > 127) return 127;
+    if (value < -127) return -127;
+    return (int8_t)value;
+}
+
+static void btTrackpadSendMove(int16_t raw_dx, int16_t raw_dy) {
+    if (raw_dx == 0 && raw_dy == 0) return;
+    int sx = raw_dx / BT_TOUCH_MOVE_DIVISOR;
+    int sy = raw_dy / BT_TOUCH_MOVE_DIVISOR;
+    if (sx == 0 && raw_dx != 0) sx = raw_dx > 0 ? 1 : -1;
+    if (sy == 0 && raw_dy != 0) sy = raw_dy > 0 ? 1 : -1;
+    btMouseMove(btClampMouseDelta(sx), btClampMouseDelta(sy), 0);
+}
+
 static TouchTapArrow touchTapArrowFromPoint(int16_t x, int16_t y) {
     const int touch_h = SCREEN_H - STATUS_H;
     if (x < 0 || x >= SCREEN_W || y < 0 || y >= touch_h) {
@@ -2002,79 +2008,107 @@ void loop() {
         bool is_touched = (touch_result == 1);
 
         if (is_touched) {
-            touch_last_x = cur_x;
-            touch_last_y = cur_y;
             if (touch_state == TOUCH_IDLE) {
                 // Touch just started
                 touch_state = TOUCH_ACTIVE;
                 touch_start_x = cur_x;
                 touch_start_y = cur_y;
+                touch_last_x = cur_x;
+                touch_last_y = cur_y;
                 touch_start_ms = now;
                 touch_did_scroll = false;
             } else {
-                // Continuing touch — check for scroll gesture
-                int16_t delta_y = cur_y - touch_start_y;
-                if (delta_y > TOUCH_SCROLL_THRESHOLD || delta_y < -TOUCH_SCROLL_THRESHOLD) {
-                    int lines_delta = delta_y / CHAR_H;
-                    if (lines_delta != 0) {
-                        if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            AppMode mode = app_mode;
-                            if (mode == MODE_NOTEPAD) {
-                                // Natural scroll: finger down = see earlier content (scroll_line decreases)
-                                LayoutInfo li = computeLayoutFrom(text_buf, text_len, cursor_pos);
-                                int max_scroll = li.total_lines > ROWS_PER_SCREEN
-                                    ? li.total_lines - ROWS_PER_SCREEN : 0;
-                                scroll_line -= lines_delta;
-                                if (scroll_line < 0) scroll_line = 0;
-                                if (scroll_line > max_scroll) scroll_line = max_scroll;
-                                render_requested = true;
-                            } else if (mode == MODE_TERMINAL) {
-                                if (terminalMouseTrackingEnabled()) {
-                                    int steps = lines_delta;
-                                    if (steps > TOUCH_SCROLL_MAX_STEPS_PER_POLL) {
-                                        steps = TOUCH_SCROLL_MAX_STEPS_PER_POLL;
-                                    }
-                                    if (steps < -TOUCH_SCROLL_MAX_STEPS_PER_POLL) {
-                                        steps = -TOUCH_SCROLL_MAX_STEPS_PER_POLL;
-                                    }
-                                    if (steps > 0) {
-                                        for (int i = 0; i < steps; i++) {
-                                            terminalSendMouseWheel(true);
+                AppMode mode = app_mode;
+                if (mode == MODE_BT) {
+                    int16_t raw_dx = cur_x - touch_last_x;
+                    int16_t raw_dy = cur_y - touch_last_y;
+                    btTrackpadSendMove(raw_dx, raw_dy);
+                    touch_last_x = cur_x;
+                    touch_last_y = cur_y;
+                    if (raw_dx > BT_TOUCH_TAP_MOVE_MAX || raw_dx < -BT_TOUCH_TAP_MOVE_MAX ||
+                        raw_dy > BT_TOUCH_TAP_MOVE_MAX || raw_dy < -BT_TOUCH_TAP_MOVE_MAX) {
+                        touch_did_scroll = true;
+                    }
+                } else {
+                    touch_last_x = cur_x;
+                    touch_last_y = cur_y;
+                    // Continuing touch — check for scroll gesture
+                    int16_t delta_y = cur_y - touch_start_y;
+                    if (delta_y > TOUCH_SCROLL_THRESHOLD || delta_y < -TOUCH_SCROLL_THRESHOLD) {
+                        int lines_delta = delta_y / CHAR_H;
+                        if (lines_delta != 0) {
+                            if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                if (mode == MODE_NOTEPAD) {
+                                    // Natural scroll: finger down = see earlier content (scroll_line decreases)
+                                    LayoutInfo li = computeLayoutFrom(text_buf, text_len, cursor_pos);
+                                    int max_scroll = li.total_lines > ROWS_PER_SCREEN
+                                        ? li.total_lines - ROWS_PER_SCREEN : 0;
+                                    scroll_line -= lines_delta;
+                                    if (scroll_line < 0) scroll_line = 0;
+                                    if (scroll_line > max_scroll) scroll_line = max_scroll;
+                                    render_requested = true;
+                                } else if (mode == MODE_TERMINAL) {
+                                    if (terminalMouseTrackingEnabled()) {
+                                        int steps = lines_delta;
+                                        if (steps > TOUCH_SCROLL_MAX_STEPS_PER_POLL) {
+                                            steps = TOUCH_SCROLL_MAX_STEPS_PER_POLL;
+                                        }
+                                        if (steps < -TOUCH_SCROLL_MAX_STEPS_PER_POLL) {
+                                            steps = -TOUCH_SCROLL_MAX_STEPS_PER_POLL;
+                                        }
+                                        if (steps > 0) {
+                                            for (int i = 0; i < steps; i++) {
+                                                terminalSendMouseWheel(true);
+                                            }
+                                        } else {
+                                            for (int i = 0; i < -steps; i++) {
+                                                terminalSendMouseWheel(false);
+                                            }
                                         }
                                     } else {
-                                        for (int i = 0; i < -steps; i++) {
-                                            terminalSendMouseWheel(false);
-                                        }
+                                        int max_scroll = term_line_count > ROWS_PER_SCREEN
+                                            ? term_line_count - ROWS_PER_SCREEN : 0;
+                                        term_scroll -= lines_delta;
+                                        if (term_scroll < 0) term_scroll = 0;
+                                        if (term_scroll > max_scroll) term_scroll = max_scroll;
+                                        term_render_requested = true;
                                     }
-                                } else {
-                                    int max_scroll = term_line_count > ROWS_PER_SCREEN
-                                        ? term_line_count - ROWS_PER_SCREEN : 0;
-                                    term_scroll -= lines_delta;
-                                    if (term_scroll < 0) term_scroll = 0;
-                                    if (term_scroll > max_scroll) term_scroll = max_scroll;
-                                    term_render_requested = true;
                                 }
+                                xSemaphoreGive(state_mutex);
                             }
-                            xSemaphoreGive(state_mutex);
+                            touch_start_y = cur_y;
+                            touch_did_scroll = true;
                         }
-                        touch_start_y = cur_y;
-                        touch_did_scroll = true;
                     }
                 }
             }
         } else {
-            if (touch_state == TOUCH_ACTIVE && !touch_did_scroll) {
+            if (touch_state == TOUCH_ACTIVE) {
                 unsigned long tap_ms = now - touch_start_ms;
                 int16_t move_x = touch_last_x - touch_start_x;
                 int16_t move_y = touch_last_y - touch_start_y;
-                bool moved_too_far = (move_x > TOUCH_SCROLL_THRESHOLD || move_x < -TOUCH_SCROLL_THRESHOLD
-                    || move_y > TOUCH_SCROLL_THRESHOLD || move_y < -TOUCH_SCROLL_THRESHOLD);
-                if (tap_ms <= TOUCH_TAP_MAX_MS && !moved_too_far) {
-                    TouchTapArrow arrow = touchTapArrowFromPoint(touch_last_x, touch_last_y);
-                    if (arrow != TOUCH_TAP_ARROW_NONE) {
-                        if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            handleTouchArrowTapLocked(arrow);
-                            xSemaphoreGive(state_mutex);
+                AppMode mode = app_mode;
+                if (mode == MODE_BT) {
+                    bool moved_too_far = (move_x > BT_TOUCH_TAP_MOVE_MAX || move_x < -BT_TOUCH_TAP_MOVE_MAX
+                        || move_y > BT_TOUCH_TAP_MOVE_MAX || move_y < -BT_TOUCH_TAP_MOVE_MAX);
+                    if (tap_ms <= TOUCH_TAP_MAX_MS && !moved_too_far) {
+                        TouchTapArrow arrow = touchTapArrowFromPoint(touch_last_x, touch_last_y);
+                        if (arrow != TOUCH_TAP_ARROW_NONE) {
+                            btSendArrowKey(arrow);
+                        } else {
+                            btMouseClick(1);
+                        }
+                    }
+                } else if (!touch_did_scroll) {
+                    bool moved_too_far = (move_x > TOUCH_SCROLL_THRESHOLD || move_x < -TOUCH_SCROLL_THRESHOLD
+                        || move_y > TOUCH_SCROLL_THRESHOLD || move_y < -TOUCH_SCROLL_THRESHOLD);
+                    if (tap_ms <= TOUCH_TAP_MAX_MS && !moved_too_far) {
+                        TouchTapArrow arrow = touchTapArrowFromPoint(touch_last_x, touch_last_y);
+                        if (arrow != TOUCH_TAP_ARROW_NONE) {
+                            if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                handleTouchArrowTapLocked(arrow);
+                                xSemaphoreGive(state_mutex);
+                            }
                         }
                     }
                 }
@@ -2097,6 +2131,8 @@ void loop() {
             needs_render = handleNotepadKeyPress(ev);
         } else if (mode == MODE_TERMINAL) {
             needs_render = handleTerminalKeyPress(ev);
+        } else if (mode == MODE_BT) {
+            needs_render = handleBluetoothKeyPress(ev);
         } else if (mode == MODE_COMMAND) {
             needs_render = handleCommandKeyPress(ev);
         }
@@ -2109,7 +2145,7 @@ void loop() {
                 render_requested = true;
             } else if (cur == MODE_TERMINAL) {
                 term_render_requested = true;
-            } else if (cur == MODE_COMMAND) {
+            } else if (cur == MODE_COMMAND || cur == MODE_BT) {
                 render_requested = true;
             }
         }

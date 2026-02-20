@@ -1,6 +1,7 @@
-// --- Bluetooth LE barebones peripheral (no HID keyboard reports) ---
+// --- Bluetooth LE HID peripheral (keyboard + trackpad mouse) ---
 
 #include <BLEDevice.h>
+#include <BLEHIDDevice.h>
 #include <BLEServer.h>
 #include <BLESecurity.h>
 #include <BLEUtils.h>
@@ -8,14 +9,16 @@
 #include <cstring>
 #include <string>
 
-#define BT_PASSKEY_MIN           100000U
-#define BT_PASSKEY_MAX           999999U
-#define BT_ADV_TIMEOUT_MS        45000U
-#define BT_SCAN_DURATION_S       4U
-#define BT_SCAN_MAX_RESULTS      12
+#define US_KEYBOARD
+#include <HIDKeyboardTypes.h>
 
-#define BT_SERVICE_UUID          "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define BT_STATUS_CHAR_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define BT_SCAN_DURATION_S           4U
+#define BT_SCAN_MAX_RESULTS          12
+#define BT_REPORT_ID_KEYBOARD        1
+#define BT_REPORT_ID_MOUSE           2
+
+#define BT_STATUS_SERVICE_UUID       "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define BT_STATUS_CHAR_UUID          "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 enum BtState { BT_STATE_OFF, BT_STATE_ADVERTISING, BT_STATE_CONNECTED, BT_STATE_ERROR };
 
@@ -24,10 +27,13 @@ static volatile bool bt_initialized = false;
 static volatile bool bt_connected = false;
 static volatile bool bt_advertising = false;
 static volatile bool bt_bonded = false;
-static unsigned long bt_adv_started_at = 0;
 
 static BLEServer* bt_server = NULL;
-static BLEService* bt_service = NULL;
+static BLEHIDDevice* bt_hid = NULL;
+static BLECharacteristic* bt_kbd_input = NULL;
+static BLECharacteristic* bt_mouse_input = NULL;
+static BLECharacteristic* bt_kbd_output = NULL;
+static BLEService* bt_status_service = NULL;
 static BLECharacteristic* bt_status_char = NULL;
 
 static char bt_peer_addr[18] = "";
@@ -48,6 +54,73 @@ static int bt_scan_total_found = 0;
 static int bt_scan_count = 0;
 static BtScanEntry bt_scan_results[BT_SCAN_MAX_RESULTS];
 
+static const uint8_t bt_hid_report_map[] = {
+    // Keyboard (Report ID 1)
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x06,       // Usage (Keyboard)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, BT_REPORT_ID_KEYBOARD,
+    0x05, 0x07,       // Usage Page (Keyboard/Keypad)
+    0x19, 0xE0,       // Usage Minimum (Keyboard LeftControl)
+    0x29, 0xE7,       // Usage Maximum (Keyboard Right GUI)
+    0x15, 0x00,       // Logical Minimum (0)
+    0x25, 0x01,       // Logical Maximum (1)
+    0x75, 0x01,       // Report Size (1)
+    0x95, 0x08,       // Report Count (8)
+    0x81, 0x02,       // Input (Data,Var,Abs)
+    0x95, 0x01,       // Report Count (1)
+    0x75, 0x08,       // Report Size (8)
+    0x81, 0x01,       // Input (Const,Array,Abs)
+    0x95, 0x06,       // Report Count (6)
+    0x75, 0x08,       // Report Size (8)
+    0x15, 0x00,       // Logical Minimum (0)
+    0x25, 0x65,       // Logical Maximum (101)
+    0x05, 0x07,       // Usage Page (Keyboard/Keypad)
+    0x19, 0x00,       // Usage Minimum (Reserved)
+    0x29, 0x65,       // Usage Maximum (Keyboard Application)
+    0x81, 0x00,       // Input (Data,Array,Abs)
+    0x95, 0x05,       // Report Count (5)
+    0x75, 0x01,       // Report Size (1)
+    0x05, 0x08,       // Usage Page (LEDs)
+    0x19, 0x01,       // Usage Minimum (Num Lock)
+    0x29, 0x05,       // Usage Maximum (Kana)
+    0x91, 0x02,       // Output (Data,Var,Abs)
+    0x95, 0x01,       // Report Count (1)
+    0x75, 0x03,       // Report Size (3)
+    0x91, 0x01,       // Output (Const,Array,Abs)
+    0xC0,             // End Collection
+
+    // Mouse (Report ID 2)
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x02,       // Usage (Mouse)
+    0xA1, 0x01,       // Collection (Application)
+    0x85, BT_REPORT_ID_MOUSE,
+    0x09, 0x01,       // Usage (Pointer)
+    0xA1, 0x00,       // Collection (Physical)
+    0x05, 0x09,       // Usage Page (Button)
+    0x19, 0x01,       // Usage Minimum (Button 1)
+    0x29, 0x03,       // Usage Maximum (Button 3)
+    0x15, 0x00,       // Logical Minimum (0)
+    0x25, 0x01,       // Logical Maximum (1)
+    0x95, 0x03,       // Report Count (3)
+    0x75, 0x01,       // Report Size (1)
+    0x81, 0x02,       // Input (Data,Var,Abs)
+    0x95, 0x01,       // Report Count (1)
+    0x75, 0x05,       // Report Size (5)
+    0x81, 0x01,       // Input (Const,Array,Abs)
+    0x05, 0x01,       // Usage Page (Generic Desktop)
+    0x09, 0x30,       // Usage (X)
+    0x09, 0x31,       // Usage (Y)
+    0x09, 0x38,       // Usage (Wheel)
+    0x15, 0x81,       // Logical Minimum (-127)
+    0x25, 0x7F,       // Logical Maximum (127)
+    0x75, 0x08,       // Report Size (8)
+    0x95, 0x03,       // Report Count (3)
+    0x81, 0x06,       // Input (Data,Var,Rel)
+    0xC0,             // End Collection
+    0xC0              // End Collection
+};
+
 static void btFormatAddr(const uint8_t* addr, char* out, size_t out_len) {
     if (!out || out_len == 0) return;
     if (!addr) {
@@ -58,12 +131,8 @@ static void btFormatAddr(const uint8_t* addr, char* out, size_t out_len) {
              addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 }
 
-static bool btPasskeyConfigured() {
-    return config_bt_passkey >= BT_PASSKEY_MIN && config_bt_passkey <= BT_PASSKEY_MAX;
-}
-
 static esp_gatt_perm_t btReadPerm() {
-    return btPasskeyConfigured() ? ESP_GATT_PERM_READ_ENC_MITM : ESP_GATT_PERM_READ_ENCRYPTED;
+    return ESP_GATT_PERM_READ_ENCRYPTED;
 }
 
 static void btSetStatusValue(const char* value) {
@@ -96,29 +165,75 @@ bool btIsBonded() {
     return bt_bonded;
 }
 
-// HID input is removed in barebones mode.
+static bool btCanSendHid() {
+    return bt_connected && bt_initialized && bt_kbd_input && bt_mouse_input;
+}
+
+static bool btSendKeyboardReport(uint8_t modifiers, uint8_t usage) {
+    if (!btCanSendHid()) return false;
+    uint8_t report[8] = { modifiers, 0x00, usage, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    bt_kbd_input->setValue(report, sizeof(report));
+    bt_kbd_input->notify();
+    return true;
+}
+
+static void btReleaseKeyboard() {
+    if (!btCanSendHid()) return;
+    uint8_t report[8] = { 0 };
+    bt_kbd_input->setValue(report, sizeof(report));
+    bt_kbd_input->notify();
+}
+
 bool btSendUsage(uint8_t usage, uint8_t modifiers) {
-    (void)usage;
-    (void)modifiers;
-    return false;
+    if (!btSendKeyboardReport(modifiers, usage)) return false;
+    delay(6);
+    btReleaseKeyboard();
+    return true;
 }
 
 bool btTypeChar(char c, uint8_t extra_modifiers) {
-    (void)c;
-    (void)extra_modifiers;
-    return false;
+    uint8_t index = (uint8_t)c;
+    if (index >= KEYMAP_SIZE) return false;
+    const KEYMAP& m = keymap[index];
+    if (m.usage == 0) return false;
+    uint8_t modifiers = (uint8_t)(m.modifier | extra_modifiers);
+    return btSendUsage(m.usage, modifiers);
 }
 
 size_t btTypeTextN(const char* text, size_t len, uint8_t extra_modifiers) {
-    (void)text;
-    (void)len;
-    (void)extra_modifiers;
-    return 0;
+    if (!text || len == 0) return 0;
+    size_t typed = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (!btTypeChar(text[i], extra_modifiers)) break;
+        typed++;
+    }
+    return typed;
 }
 
 size_t btTypeText(const char* text) {
-    (void)text;
-    return 0;
+    if (!text) return 0;
+    return btTypeTextN(text, strlen(text), 0);
+}
+
+bool btMouseMove(int8_t dx, int8_t dy, int8_t wheel) {
+    if (!btCanSendHid()) return false;
+    if (dx == 0 && dy == 0 && wheel == 0) return true;
+    uint8_t report[4] = { 0x00, (uint8_t)dx, (uint8_t)dy, (uint8_t)wheel };
+    bt_mouse_input->setValue(report, sizeof(report));
+    bt_mouse_input->notify();
+    return true;
+}
+
+bool btMouseClick(uint8_t buttons) {
+    if (!btCanSendHid()) return false;
+    uint8_t report[4] = { (uint8_t)(buttons & 0x07), 0x00, 0x00, 0x00 };
+    bt_mouse_input->setValue(report, sizeof(report));
+    bt_mouse_input->notify();
+    delay(8);
+    report[0] = 0;
+    bt_mouse_input->setValue(report, sizeof(report));
+    bt_mouse_input->notify();
+    return true;
 }
 
 class BtServerCallbacks : public BLEServerCallbacks {
@@ -138,8 +253,7 @@ class BtServerCallbacks : public BLEServerCallbacks {
         if (param) {
             btFormatAddr(param->connect.remote_bda, bt_peer_addr, sizeof(bt_peer_addr));
             SERIAL_LOGF("BT: peer=%s\n", bt_peer_addr);
-            esp_ble_sec_act_t sec_act = btPasskeyConfigured() ? ESP_BLE_SEC_ENCRYPT_MITM : ESP_BLE_SEC_ENCRYPT_NO_MITM;
-            esp_err_t err = esp_ble_set_encryption(param->connect.remote_bda, sec_act);
+            esp_err_t err = esp_ble_set_encryption(param->connect.remote_bda, ESP_BLE_SEC_ENCRYPT_NO_MITM);
             if (err != ESP_OK) {
                 SERIAL_LOGF("BT: set_encryption failed err=%d\n", (int)err);
             }
@@ -167,7 +281,7 @@ class BtServerCallbacks : public BLEServerCallbacks {
 
 class BtSecurityCallbacks : public BLESecurityCallbacks {
     uint32_t onPassKeyRequest() override {
-        return btPasskeyConfigured() ? config_bt_passkey : 123456;
+        return 0;
     }
 
     void onPassKeyNotify(uint32_t pass_key) override {
@@ -201,10 +315,9 @@ static BtSecurityCallbacks bt_security_callbacks;
 static BLESecurity bt_security;
 
 static void btStartAdvertising() {
-    if (!bt_initialized || !config_bt_enabled || bt_connected) return;
+    if (!bt_initialized || !config_bt_enabled || bt_connected || bt_scan_running) return;
     BLEDevice::startAdvertising();
     bt_advertising = true;
-    bt_adv_started_at = millis();
     bt_state = BT_STATE_ADVERTISING;
     btSetStatusValue("advertising");
     SERIAL_LOGLN("BT: advertising");
@@ -219,14 +332,8 @@ void btInit() {
     BLEDevice::init(config_bt_name);
     BLEDevice::setSecurityCallbacks(&bt_security_callbacks);
 
-    if (btPasskeyConfigured()) {
-        bt_security.setStaticPIN(config_bt_passkey);
-        bt_security.setCapability(ESP_IO_CAP_OUT);
-        bt_security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-    } else {
-        bt_security.setCapability(ESP_IO_CAP_NONE);
-        bt_security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
-    }
+    bt_security.setCapability(ESP_IO_CAP_NONE);
+    bt_security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
     bt_security.setKeySize(16);
     bt_security.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
     bt_security.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
@@ -239,25 +346,55 @@ void btInit() {
     }
     bt_server->setCallbacks(&bt_server_callbacks);
 
-    bt_service = bt_server->createService(BT_SERVICE_UUID);
-    if (!bt_service) {
+    bt_hid = new BLEHIDDevice(bt_server);
+    if (!bt_hid) {
         bt_state = BT_STATE_ERROR;
-        SERIAL_LOGLN("BT: createService failed");
+        SERIAL_LOGLN("BT: createHID failed");
         return;
     }
 
-    bt_status_char = bt_service->createCharacteristic(BT_STATUS_CHAR_UUID, BLECharacteristic::PROPERTY_READ);
+    bt_kbd_input = bt_hid->inputReport(BT_REPORT_ID_KEYBOARD);
+    bt_kbd_output = bt_hid->outputReport(BT_REPORT_ID_KEYBOARD);
+    bt_mouse_input = bt_hid->inputReport(BT_REPORT_ID_MOUSE);
+    if (!bt_kbd_input || !bt_kbd_output || !bt_mouse_input) {
+        bt_state = BT_STATE_ERROR;
+        SERIAL_LOGLN("BT: create HID reports failed");
+        return;
+    }
+
+    bt_hid->manufacturer()->setValue("LilyGo");
+    bt_hid->pnp(0x02, 0xE502, 0xA111, 0x0210);
+    bt_hid->hidInfo(0x00, 0x02);
+    bt_hid->reportMap((uint8_t*)bt_hid_report_map, sizeof(bt_hid_report_map));
+    bt_hid->startServices();
+    bt_hid->setBatteryLevel(100);
+
+    bt_status_service = bt_server->createService(BT_STATUS_SERVICE_UUID);
+    if (!bt_status_service) {
+        bt_state = BT_STATE_ERROR;
+        SERIAL_LOGLN("BT: create status service failed");
+        return;
+    }
+
+    bt_status_char = bt_status_service->createCharacteristic(BT_STATUS_CHAR_UUID, BLECharacteristic::PROPERTY_READ);
     if (!bt_status_char) {
         bt_state = BT_STATE_ERROR;
-        SERIAL_LOGLN("BT: createCharacteristic failed");
+        SERIAL_LOGLN("BT: create status characteristic failed");
         return;
     }
     bt_status_char->setAccessPermissions(btReadPerm());
     btSetStatusValue("idle");
-    bt_service->start();
+    bt_status_service->start();
 
     BLEAdvertising* adv = BLEDevice::getAdvertising();
-    adv->addServiceUUID(bt_service->getUUID());
+    if (!adv) {
+        bt_state = BT_STATE_ERROR;
+        SERIAL_LOGLN("BT: getAdvertising failed");
+        return;
+    }
+    adv->addServiceUUID(bt_hid->hidService()->getUUID());
+    adv->addServiceUUID(bt_status_service->getUUID());
+    adv->setAppearance(HID_KEYBOARD);
     adv->setScanResponse(true);
     adv->setMinPreferred(0x06);
     adv->setMaxPreferred(0x12);
@@ -269,9 +406,7 @@ void btInit() {
     bt_peer_addr[0] = '\0';
 
     btStartAdvertising();
-    SERIAL_LOGF("BT: bare mode ready name=%s%s\n",
-                  config_bt_name,
-                  btPasskeyConfigured() ? " (secure pin)" : "");
+    SERIAL_LOGF("BT: HID mode ready name=%s (encrypted bonding)\n", config_bt_name);
 }
 
 void btShutdown() {
@@ -287,15 +422,32 @@ void btShutdown() {
     bt_scan_resume_adv = false;
     bt_scan_restore_disabled = false;
 
+    // Clear report/status characteristic pointers first so callbacks that may
+    // fire during disconnect/deinit never touch freed BLE objects.
+    bt_kbd_input = NULL;
+    bt_mouse_input = NULL;
+    bt_kbd_output = NULL;
+    bt_status_char = NULL;
+
     if (bt_connected && bt_server) {
         bt_server->disconnect(bt_server->getConnId());
     }
-    if (bt_initialized) BLEDevice::stopAdvertising();
+    if (bt_initialized) {
+        BLEDevice::stopAdvertising();
+        delay(20);
+        BLEDevice::deinit(false);
+    }
+    bt_server = NULL;
+    bt_hid = NULL;
+    bt_kbd_input = NULL;
+    bt_mouse_input = NULL;
+    bt_kbd_output = NULL;
+    bt_status_service = NULL;
+    bt_status_char = NULL;
+    bt_initialized = false;
     bt_connected = false;
     bt_advertising = false;
-    bt_adv_started_at = 0;
     bt_state = BT_STATE_OFF;
-    btSetStatusValue("off");
 }
 
 bool btSetEnabled(bool enabled) {
@@ -307,7 +459,7 @@ bool btSetEnabled(bool enabled) {
         render_requested = true;
         term_render_requested = true;
         SERIAL_LOGLN("BT: disabled");
-        return false;
+        return true;
     }
 
     config_bt_enabled = true;
@@ -315,6 +467,13 @@ bool btSetEnabled(bool enabled) {
         btInit();
     } else {
         btStartAdvertising();
+    }
+    if (!bt_initialized) {
+        config_bt_enabled = false;
+        render_requested = true;
+        term_render_requested = true;
+        SERIAL_LOGLN("BT: enable failed");
+        return false;
     }
     render_requested = true;
     term_render_requested = true;
@@ -327,18 +486,9 @@ void btPoll() {
         btInit();
         return;
     }
-
-    if (bt_advertising && !bt_connected) {
-        unsigned long now = millis();
-        if (now - bt_adv_started_at >= BT_ADV_TIMEOUT_MS) {
-            BLEDevice::stopAdvertising();
-            bt_advertising = false;
-            bt_state = BT_STATE_OFF;
-            btSetStatusValue("idle");
-            render_requested = true;
-            term_render_requested = true;
-            SERIAL_LOGLN("BT: advertising timeout -> idle");
-        }
+    if (bt_scan_running) return;
+    if (!bt_connected && !bt_advertising) {
+        btStartAdvertising();
     }
 }
 

@@ -347,6 +347,44 @@ void renderTerminalFullClean() {
     } while (display.nextPage());
 }
 
+void drawBtTrackpadStatusBar() {
+    int bar_y = SCREEN_H - STATUS_H;
+    display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
+    display.setTextColor(GxEPD_WHITE);
+    display.setFont(NULL);
+    char status[72];
+    if (btIsConnected()) {
+        snprintf(status, sizeof(status), "BT trackpad %s", btPeerAddress());
+    } else if (btIsEnabled()) {
+        snprintf(status, sizeof(status), "BT trackpad waiting...");
+    } else {
+        snprintf(status, sizeof(status), "BT off");
+    }
+    char right[48];
+    buildStatusRight(right, sizeof(right), true);
+    drawStatusBarLine(status, right, bar_y);
+}
+
+void renderBtTrackpad() {
+    partial_count++;
+    display.setPartialWindow(0, 0, SCREEN_W, SCREEN_H);
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        drawBtTrackpadStatusBar();
+    } while (display.nextPage());
+}
+
+void renderBtTrackpadFullClean() {
+    partial_count = 0;
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        drawBtTrackpadStatusBar();
+    } while (display.nextPage());
+}
+
 // --- Notepad Rendering ---
 
 void refreshLines(int first_line, int last_line, const LayoutInfo& layout) {
@@ -447,6 +485,10 @@ void displayTask(void* param) {
                 uint32_t render_started = millis();
                 renderTerminalFullClean();
                 perfRecordRenderMs(millis() - render_started);
+            } else if (cur_mode == MODE_BT) {
+                uint32_t render_started = millis();
+                renderBtTrackpadFullClean();
+                perfRecordRenderMs(millis() - render_started);
             } else if (cur_mode == MODE_COMMAND) {
                 uint32_t render_started = millis();
                 renderCommandPrompt();
@@ -487,6 +529,22 @@ void displayTask(void* param) {
                         renderTerminal();
                     }
                 }
+                perfRecordRenderMs(millis() - render_started);
+                display_idle = true;
+            }
+            vTaskDelay(1);
+            continue;
+        }
+
+        // --- Bluetooth trackpad mode ---
+        if (cur_mode == MODE_BT) {
+            if (render_requested || term_render_requested) {
+                render_requested = false;
+                term_render_requested = false;
+                display_idle = false;
+                uint32_t render_started = millis();
+                if (partial_count >= 20) renderBtTrackpadFullClean();
+                else renderBtTrackpad();
                 perfRecordRenderMs(millis() - render_started);
                 display_idle = true;
             }

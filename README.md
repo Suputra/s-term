@@ -6,7 +6,7 @@ Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file wo
 - Default mode is a keyboard-driven notepad rendered on the e-ink panel. Files can be saved to the SD card.
 - `ssh` switches to terminal mode (WiFi first, then VPN fallback when configured).
 - Files live on SD root and can be edited/saved on-device or transferred with SCP mirror sync (`upload` / `download`).
-- Bluetooth mode is a BLE peripheral service.
+- `bt` toggles BLE HID peripheral mode (keyboard + touch trackpad).
 
 ## Quickstart
 ### 1) Install tools
@@ -85,7 +85,6 @@ DNS
 
 # bt
 s-term
-123456
 
 # time
 PST8PDT,M3.2.0,M11.1.0
@@ -99,8 +98,9 @@ Notes:
 - `# wifi`: lines are SSID/password pairs. If password is blank (or section ends right after SSID), that AP is treated as open.
 - `# ssh`: host, port, user, password, optional VPN-only host override.
 - `# vpn`: private key, server pubkey, PSK, local VPN IP, endpoint, port, optional DNS.
-- `# bt`: optional device name, optional 6-digit passkey.
-- If `# bt` is missing, Bluetooth stays off at boot. Runtime control is the `bt` command (toggle only).
+- `# bt`: optional device name.
+- Bluetooth always starts off at boot. Runtime control is the `bt` command (toggle only).
+- Legacy `enable`/`disable` and passkey lines in `# bt` are ignored.
 - If `# time` is missing, timezone defaults to `UTC0`.
 - `# msh`: optional Meshtastic channel config (`line1=channel name`, `line2=key spec`). Key spec supports `default`, `none`, decimal index (`1` = default public key), `hex:<...>`, or `base64:<...>`.
 
@@ -118,13 +118,19 @@ Run `ssh` from command mode to switch to terminal mode. Device connects WiFi, tr
 - `Alt`: acts as Ctrl (`Alt + Space` sends Esc)
 - Touch tap: sends terminal arrow keys
 
-### Bluetooth (bare mode)
+### Bluetooth (HID keyboard + trackpad mode)
 Bluetooth is runtime-toggleable from command mode:
 
-- `bt`: toggle Bluetooth on/off
+- `bt`: toggle Bluetooth HID mode on/off
 - `bs`: scan nearby BLE devices
 
-Advertising is not kept alive indefinitely (times out to idle) to reduce unwanted wakeups.
+When BT mode is on:
+- The display switches to a blank trackpad screen.
+- Touch input sends relative mouse movement.
+- Tap near center sends left click; directional-area taps send arrow keys.
+- Physical keyboard keys are sent as BLE HID keyboard input.
+- `Alt` works as `Ctrl` (same behavior as terminal mode).
+- Single-tap `MIC` opens command mode; run `bt` again to shut down the BT radio.
 
 ### Meshtastic radio control
 Meshtastic/Lora radio power is runtime-toggleable from command mode.
@@ -157,7 +163,7 @@ Touch arrows in command mode browse command history. In file-picker mode: Up/Dow
 | `mds` | 4G modem status scan (non-blocking) |
 | `mdm` | Toggle 4G modem power (non-blocking) |
 | `bs` | Scan nearby BLE devices (non-blocking) |
-| `bt` | Toggle Bluetooth on/off |
+| `bt` | Toggle Bluetooth HID mode on/off |
 | `gps` | Toggle GPS on/off |
 | `gs` / `gpss` | GPS detail scan (non-blocking) |
 | `mss` | Meshtastic radio/mesh status scan (non-blocking) |
@@ -229,7 +235,7 @@ Major firmware components are split into flat module headers in `src/`:
 - `src/network_module.hpp` (WiFi, SSH, VPN connectivity)
 - `src/modem_module.hpp` (A7682E modem power + LTE scan helpers)
 - `src/meshtastic_module.hpp` (SX126x power control + Meshtastic-compatible RX/TX/status)
-- `src/bluetooth_module.hpp` (BLE peripheral, pairing/bonding, runtime toggle)
+- `src/bluetooth_module.hpp` (BLE HID peripheral: keyboard + mouse, pairing/bonding, runtime toggle)
 - `src/screen_module.hpp` (display rendering/task logic)
 - `src/keyboard_module.hpp` (keyboard input + mode handlers)
 - `src/cli_module.hpp` (command parsing, SCP helpers, poweroff flow)
