@@ -143,7 +143,7 @@ When powered on, firmware uses Meshtastic-compatible packet format/encryption fo
 
 ### Command Processor
 Single-tap `MIC` from any mode to open command mode (bottom half of screen).
-Touch arrows in command mode browse command history. In file-picker mode: Up/Down moves, Left/Right pages.
+Touch arrows in command mode browse command history. In picker mode (`edit`/`ws`): Up/Down moves, Left/Right pages.
 
 | Command | Description |
 |---------|-------------|
@@ -158,7 +158,7 @@ Touch arrows in command mode browse command history. In file-picker mode: Up/Dow
 | `ssh` | Switch to terminal mode and connect if needed |
 | `np` | Return to notepad mode |
 | `dc` | Disconnect SSH |
-| `ws` | Scan WiFi and retry known APs |
+| `ws` | Scan WiFi and open selector. Enter connects to selected AP (`*` known, `o` open, `l` locked). Open unknown APs are auto-added to runtime config and appended to `/CONFIG`. |
 | `wfi` | Toggle WiFi on/off |
 | `mds` | 4G modem status scan (non-blocking) |
 | `mdm` | Toggle 4G modem power (non-blocking) |

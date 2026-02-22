@@ -1312,11 +1312,31 @@ struct FileEntry {
 #define MAX_FILE_LIST 50
 static FileEntry file_list[MAX_FILE_LIST];
 static int file_list_count = 0;
-static bool cmd_edit_picker_active = false;
-static int  cmd_edit_picker_indices[MAX_FILE_LIST];
-static int  cmd_edit_picker_count = 0;
-static int  cmd_edit_picker_selected = 0;
-static int  cmd_edit_picker_top = 0;
+enum CmdPickerMode {
+    CMD_PICKER_NONE = 0,
+    CMD_PICKER_EDIT,
+    CMD_PICKER_WIFI,
+};
+
+struct WifiScanPickerEntry {
+    char ssid[64];
+    int rssi;
+    bool known;
+    bool open_network;
+};
+
+static constexpr int WIFI_SCAN_PICKER_MAX = 32;
+static WifiScanPickerEntry wifi_scan_picker[WIFI_SCAN_PICKER_MAX];
+static int wifi_scan_picker_count = 0;
+
+static CmdPickerMode cmd_picker_mode = CMD_PICKER_NONE;
+static int  cmd_picker_indices[MAX_FILE_LIST];
+static int  cmd_picker_count = 0;
+static int  cmd_picker_selected = 0;
+static int  cmd_picker_top = 0;
+
+// Implemented in cli_module.hpp.
+bool wifiPickerConnectSelectedNetwork(const char* ssid, bool open_network, bool known_network);
 
 int listDirectory(const char* path);
 bool loadFromFile(const char* path);
@@ -1424,116 +1444,146 @@ static bool cmdHistoryBrowseLocked(int direction) {
     return true;
 }
 
-int cmdEditPickerVisibleRows() {
+bool cmdPickerIsActive() {
+    return cmd_picker_mode != CMD_PICKER_NONE && cmd_picker_count > 0;
+}
+
+bool cmdPickerIsEditActive() {
+    return cmd_picker_mode == CMD_PICKER_EDIT && cmdPickerIsActive();
+}
+
+bool cmdPickerIsWifiActive() {
+    return cmd_picker_mode == CMD_PICKER_WIFI && cmdPickerIsActive();
+}
+
+const char* cmdPickerPromptWord() {
+    if (cmd_picker_mode == CMD_PICKER_EDIT) return "edit";
+    if (cmd_picker_mode == CMD_PICKER_WIFI) return "ws";
+    return "";
+}
+
+const char* cmdPickerStatusHint() {
+    if (cmd_picker_mode == CMD_PICKER_WIFI) return "[PICK] WiFi W/S A/D Enter";
+    if (cmd_picker_mode == CMD_PICKER_EDIT) return "[PICK] Edit W/S A/D Enter";
+    return "";
+}
+
+int cmdPickerVisibleRows() {
     int rows = CMD_RESULT_LINES - 1; // Reserve first line for picker status/help text
     if (rows < 1) rows = 1;
     return rows;
 }
 
-void cmdEditPickerStop() {
-    cmd_edit_picker_active = false;
-    cmd_edit_picker_count = 0;
-    cmd_edit_picker_selected = 0;
-    cmd_edit_picker_top = 0;
+void cmdPickerStop() {
+    cmd_picker_mode = CMD_PICKER_NONE;
+    cmd_picker_count = 0;
+    cmd_picker_selected = 0;
+    cmd_picker_top = 0;
 }
 
-void cmdEditPickerSyncViewport() {
-    if (cmd_edit_picker_count <= 0) {
-        cmd_edit_picker_top = 0;
-        cmd_edit_picker_selected = 0;
+void cmdPickerSyncViewport() {
+    if (cmd_picker_count <= 0) {
+        cmd_picker_top = 0;
+        cmd_picker_selected = 0;
         return;
     }
-    if (cmd_edit_picker_selected < 0) cmd_edit_picker_selected = 0;
-    if (cmd_edit_picker_selected >= cmd_edit_picker_count) cmd_edit_picker_selected = cmd_edit_picker_count - 1;
+    if (cmd_picker_selected < 0) cmd_picker_selected = 0;
+    if (cmd_picker_selected >= cmd_picker_count) cmd_picker_selected = cmd_picker_count - 1;
 
-    int rows = cmdEditPickerVisibleRows();
-    if (cmd_edit_picker_selected < cmd_edit_picker_top) {
-        cmd_edit_picker_top = cmd_edit_picker_selected;
-    } else if (cmd_edit_picker_selected >= cmd_edit_picker_top + rows) {
-        cmd_edit_picker_top = cmd_edit_picker_selected - rows + 1;
+    int rows = cmdPickerVisibleRows();
+    if (cmd_picker_selected < cmd_picker_top) {
+        cmd_picker_top = cmd_picker_selected;
+    } else if (cmd_picker_selected >= cmd_picker_top + rows) {
+        cmd_picker_top = cmd_picker_selected - rows + 1;
     }
 
-    int max_top = cmd_edit_picker_count - rows;
+    int max_top = cmd_picker_count - rows;
     if (max_top < 0) max_top = 0;
-    if (cmd_edit_picker_top < 0) cmd_edit_picker_top = 0;
-    if (cmd_edit_picker_top > max_top) cmd_edit_picker_top = max_top;
+    if (cmd_picker_top < 0) cmd_picker_top = 0;
+    if (cmd_picker_top > max_top) cmd_picker_top = max_top;
 }
 
-void cmdEditPickerRender() {
-    if (!cmd_edit_picker_active || cmd_edit_picker_count <= 0) {
-        cmdSetResult("(no files)");
+void cmdPickerRender() {
+    if (!cmdPickerIsActive()) {
+        if (cmd_picker_mode == CMD_PICKER_WIFI) cmdSetResult("(no wifi)");
+        else cmdSetResult("(no files)");
         return;
     }
 
-    cmdEditPickerSyncViewport();
+    cmdPickerSyncViewport();
     cmdClearResult();
-    cmdAddLine("Edit %d/%d W/S A/D Enter", cmd_edit_picker_selected + 1, cmd_edit_picker_count);
 
-    int rows = cmdEditPickerVisibleRows();
+    if (cmd_picker_mode == CMD_PICKER_EDIT) {
+        cmdAddLine("Edit %d/%d W/S A/D Enter", cmd_picker_selected + 1, cmd_picker_count);
+    } else if (cmd_picker_mode == CMD_PICKER_WIFI) {
+        cmdAddLine("WiFi %d/%d *known o=open", cmd_picker_selected + 1, cmd_picker_count);
+    } else {
+        cmdSetResult("(picker unavailable)");
+        return;
+    }
+
+    int rows = cmdPickerVisibleRows();
     for (int i = 0; i < rows && cmd_result_count < CMD_RESULT_LINES; i++) {
-        int list_idx = cmd_edit_picker_top + i;
-        if (list_idx >= cmd_edit_picker_count) break;
-        const FileEntry& entry = file_list[cmd_edit_picker_indices[list_idx]];
-        cmdAddLine("%c%s %dB", (list_idx == cmd_edit_picker_selected) ? '>' : ' ', entry.name, (int)entry.size);
-    }
-}
+        int list_idx = cmd_picker_top + i;
+        if (list_idx >= cmd_picker_count) break;
+        int ref_idx = cmd_picker_indices[list_idx];
 
-bool cmdEditPickerStart() {
-    int n = listDirectory("/");
-    if (n < 0) {
-        cmdEditPickerStop();
-        cmdSetResult("Can't read SD");
-        return false;
-    }
-
-    cmd_edit_picker_count = 0;
-    for (int i = 0; i < n && i < MAX_FILE_LIST; i++) {
-        if (!file_list[i].is_dir) {
-            cmd_edit_picker_indices[cmd_edit_picker_count++] = i;
+        if (cmd_picker_mode == CMD_PICKER_EDIT) {
+            if (ref_idx < 0 || ref_idx >= MAX_FILE_LIST) continue;
+            const FileEntry& entry = file_list[ref_idx];
+            cmdAddLine("%c%s %dB", (list_idx == cmd_picker_selected) ? '>' : ' ', entry.name, (int)entry.size);
+        } else if (cmd_picker_mode == CMD_PICKER_WIFI) {
+            if (ref_idx < 0 || ref_idx >= wifi_scan_picker_count) continue;
+            const WifiScanPickerEntry& entry = wifi_scan_picker[ref_idx];
+            char known_mark = entry.known ? '*' : ' ';
+            char open_mark = entry.open_network ? 'o' : 'l';
+            cmdAddLine("%c%c%c %s %ddBm",
+                       (list_idx == cmd_picker_selected) ? '>' : ' ',
+                       known_mark,
+                       open_mark,
+                       entry.ssid,
+                       entry.rssi);
         }
     }
-
-    if (cmd_edit_picker_count == 0) {
-        cmdEditPickerStop();
-        cmdSetResult("(no files)");
-        return false;
-    }
-
-    cmd_edit_picker_active = true;
-    cmd_edit_picker_selected = 0;
-    cmd_edit_picker_top = 0;
-    cmdEditPickerRender();
-    return true;
 }
 
-bool cmdEditPickerMoveSelection(int delta) {
-    if (!cmd_edit_picker_active || cmd_edit_picker_count <= 0) return false;
-    int next = cmd_edit_picker_selected + delta;
+void cmdPickerStart(CmdPickerMode mode) {
+    cmd_picker_mode = mode;
+    cmd_picker_selected = 0;
+    cmd_picker_top = 0;
+    cmdPickerRender();
+}
+
+bool cmdPickerMoveSelection(int delta) {
+    if (!cmdPickerIsActive()) return false;
+    int next = cmd_picker_selected + delta;
     if (next < 0) next = 0;
-    if (next >= cmd_edit_picker_count) next = cmd_edit_picker_count - 1;
-    if (next == cmd_edit_picker_selected) return false;
-    cmd_edit_picker_selected = next;
-    cmdEditPickerRender();
+    if (next >= cmd_picker_count) next = cmd_picker_count - 1;
+    if (next == cmd_picker_selected) return false;
+    cmd_picker_selected = next;
+    cmdPickerRender();
     return true;
 }
 
-bool cmdEditPickerPage(int direction) {
-    int rows = cmdEditPickerVisibleRows();
+bool cmdPickerPage(int direction) {
+    int rows = cmdPickerVisibleRows();
     if (rows < 1) rows = 1;
-    return cmdEditPickerMoveSelection(direction * rows);
+    return cmdPickerMoveSelection(direction * rows);
 }
 
-bool cmdEditPickerOpenSelected() {
-    if (!cmd_edit_picker_active || cmd_edit_picker_count <= 0) return false;
+bool cmdEditPickerOpenSelectedInternal() {
+    if (!cmdPickerIsEditActive()) return false;
 
-    int list_idx = cmd_edit_picker_selected;
-    if (list_idx < 0 || list_idx >= cmd_edit_picker_count) return false;
-    const FileEntry& entry = file_list[cmd_edit_picker_indices[list_idx]];
+    int list_idx = cmd_picker_selected;
+    if (list_idx < 0 || list_idx >= cmd_picker_count) return false;
+    int file_idx = cmd_picker_indices[list_idx];
+    if (file_idx < 0 || file_idx >= MAX_FILE_LIST) return false;
+    const FileEntry& entry = file_list[file_idx];
 
     autoSaveDirty();
     String path = "/" + String(entry.name);
     bool ok = loadFromFile(path.c_str());
-    cmdEditPickerStop();
+    cmdPickerStop();
     if (ok) {
         current_file = path;
         cmdSetResult("Loaded %s (%d B)", entry.name, text_len);
@@ -1541,6 +1591,132 @@ bool cmdEditPickerOpenSelected() {
     } else {
         cmdSetResult("Load failed: %s", entry.name);
     }
+    return true;
+}
+
+bool cmdWifiPickerOpenSelectedInternal() {
+    if (!cmdPickerIsWifiActive()) return false;
+
+    int list_idx = cmd_picker_selected;
+    if (list_idx < 0 || list_idx >= cmd_picker_count) return false;
+    int wifi_idx = cmd_picker_indices[list_idx];
+    if (wifi_idx < 0 || wifi_idx >= wifi_scan_picker_count) return false;
+
+    char ssid[sizeof(wifi_scan_picker[wifi_idx].ssid)];
+    strncpy(ssid, wifi_scan_picker[wifi_idx].ssid, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    bool open_network = wifi_scan_picker[wifi_idx].open_network;
+    bool known_network = wifi_scan_picker[wifi_idx].known;
+
+    cmdPickerStop();
+    return wifiPickerConnectSelectedNetwork(ssid, open_network, known_network);
+}
+
+bool cmdPickerOpenSelected() {
+    if (!cmdPickerIsActive()) return false;
+    if (cmd_picker_mode == CMD_PICKER_EDIT) return cmdEditPickerOpenSelectedInternal();
+    if (cmd_picker_mode == CMD_PICKER_WIFI) return cmdWifiPickerOpenSelectedInternal();
+    return false;
+}
+
+bool cmdPickerCancel() {
+    if (!cmdPickerIsActive()) return false;
+    CmdPickerMode mode = cmd_picker_mode;
+    cmdPickerStop();
+    if (mode == CMD_PICKER_WIFI) cmdSetResult("WiFi select cancelled");
+    else cmdSetResult("Edit cancelled");
+    return true;
+}
+
+void cmdEditPickerStop() {
+    cmdPickerStop();
+}
+
+bool cmdEditPickerStart() {
+    int n = listDirectory("/");
+    if (n < 0) {
+        cmdPickerStop();
+        cmdSetResult("Can't read SD");
+        return false;
+    }
+
+    cmd_picker_count = 0;
+    for (int i = 0; i < n && i < MAX_FILE_LIST; i++) {
+        if (!file_list[i].is_dir) {
+            cmd_picker_indices[cmd_picker_count++] = i;
+        }
+    }
+
+    if (cmd_picker_count == 0) {
+        cmdPickerStop();
+        cmdSetResult("(no files)");
+        return false;
+    }
+
+    cmdPickerStart(CMD_PICKER_EDIT);
+    return true;
+}
+
+bool cmdEditPickerMoveSelection(int delta) {
+    if (!cmdPickerIsEditActive()) return false;
+    return cmdPickerMoveSelection(delta);
+}
+
+bool cmdEditPickerPage(int direction) {
+    if (!cmdPickerIsEditActive()) return false;
+    return cmdPickerPage(direction);
+}
+
+bool cmdEditPickerOpenSelected() {
+    if (!cmdPickerIsEditActive()) return false;
+    return cmdEditPickerOpenSelectedInternal();
+}
+
+void cmdWifiPickerResetResults() {
+    wifi_scan_picker_count = 0;
+}
+
+bool cmdWifiPickerAddResult(const char* ssid, int rssi, bool known, bool open_network) {
+    if (!ssid || ssid[0] == '\0') return false;
+
+    // Collapse duplicate SSIDs and keep strongest RSSI.
+    for (int i = 0; i < wifi_scan_picker_count; i++) {
+        if (strncmp(wifi_scan_picker[i].ssid, ssid, sizeof(wifi_scan_picker[i].ssid)) == 0) {
+            if (rssi > wifi_scan_picker[i].rssi) wifi_scan_picker[i].rssi = rssi;
+            wifi_scan_picker[i].known = wifi_scan_picker[i].known || known;
+            wifi_scan_picker[i].open_network = wifi_scan_picker[i].open_network || open_network;
+            return true;
+        }
+    }
+
+    if (wifi_scan_picker_count >= WIFI_SCAN_PICKER_MAX) return false;
+    WifiScanPickerEntry& entry = wifi_scan_picker[wifi_scan_picker_count++];
+    strncpy(entry.ssid, ssid, sizeof(entry.ssid) - 1);
+    entry.ssid[sizeof(entry.ssid) - 1] = '\0';
+    entry.rssi = rssi;
+    entry.known = known;
+    entry.open_network = open_network;
+    return true;
+}
+
+bool cmdWifiPickerStart() {
+    if (wifi_scan_picker_count <= 0) {
+        cmdPickerStop();
+        cmdSetResult("No WiFi networks found");
+        return false;
+    }
+
+    cmd_picker_count = 0;
+    for (int i = 0; i < wifi_scan_picker_count && i < MAX_FILE_LIST; i++) {
+        cmd_picker_indices[cmd_picker_count++] = i;
+    }
+    if (cmd_picker_count <= 0) {
+        cmdPickerStop();
+        cmdSetResult("No WiFi networks found");
+        return false;
+    }
+
+    cmdPickerStart(CMD_PICKER_WIFI);
     return true;
 }
 
@@ -1731,11 +1907,11 @@ static void handleTouchArrowTapLocked(TouchTapArrow arrow) {
 
     if (app_mode == MODE_COMMAND) {
         bool changed = false;
-        if (cmd_edit_picker_active) {
-            if (arrow == TOUCH_TAP_ARROW_UP) changed = cmdEditPickerMoveSelection(-1);
-            else if (arrow == TOUCH_TAP_ARROW_DOWN) changed = cmdEditPickerMoveSelection(1);
-            else if (arrow == TOUCH_TAP_ARROW_LEFT) changed = cmdEditPickerPage(-1);
-            else if (arrow == TOUCH_TAP_ARROW_RIGHT) changed = cmdEditPickerPage(1);
+        if (cmdPickerIsActive()) {
+            if (arrow == TOUCH_TAP_ARROW_UP) changed = cmdPickerMoveSelection(-1);
+            else if (arrow == TOUCH_TAP_ARROW_DOWN) changed = cmdPickerMoveSelection(1);
+            else if (arrow == TOUCH_TAP_ARROW_LEFT) changed = cmdPickerPage(-1);
+            else if (arrow == TOUCH_TAP_ARROW_RIGHT) changed = cmdPickerPage(1);
         } else {
             if (arrow == TOUCH_TAP_ARROW_UP) changed = cmdHistoryBrowseLocked(-1);
             else if (arrow == TOUCH_TAP_ARROW_DOWN) changed = cmdHistoryBrowseLocked(1);
@@ -1991,7 +2167,7 @@ void loop() {
             cmd_buf[0] = '\0';
             cmdHistoryResetBrowseLocked();
             cmd_result_valid = false;
-            cmdEditPickerStop();
+            cmdPickerStop();
             app_mode = MODE_COMMAND;
             xSemaphoreGive(state_mutex);
             render_requested = true;

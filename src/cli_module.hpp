@@ -48,6 +48,7 @@ static constexpr uint32_t MODEM_SCAN_DWELL_MS = MODEM_SCAN_DEFAULT_DWELL_MS;
 void finishWifiScanCommand() {
     int n = WiFi.scanComplete();
     wifi_scan_pending = false;
+    cmdWifiPickerResetResults();
 
     if (n == WIFI_SCAN_FAILED) {
         cmdSetResult("Scan failed");
@@ -63,26 +64,26 @@ void finishWifiScanCommand() {
         return;
     }
 
-    cmdClearResult();
-    cmdAddLine("Scan: %d network(s)", n);
-    for (int i = 0; i < n && i < 8; i++) {
-        int cfg_idx = wifiConfigIndexForSSID(WiFi.SSID(i));
-        cmdAddLine("%c %s %ddBm",
-                   cfg_idx >= 0 ? '*' : ' ',
-                   WiFi.SSID(i).c_str(),
-                   WiFi.RSSI(i));
-    }
-
-    bool has_known = false;
+    int hidden = 0;
     for (int i = 0; i < n; i++) {
-        if (wifiConfigIndexForSSID(WiFi.SSID(i)) >= 0) {
-            has_known = true;
-            break;
+        String ssid = WiFi.SSID(i);
+        if (ssid.length() == 0) {
+            hidden++;
+            continue;
         }
+        int cfg_idx = wifiConfigIndexForSSID(ssid);
+        bool open_network = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        cmdWifiPickerAddResult(ssid.c_str(), WiFi.RSSI(i), cfg_idx >= 0, open_network);
     }
-    cmdAddLine(has_known ? "Use cmd: wfi" : "No known SSIDs in scan");
 
     WiFi.scanDelete();
+    if (!cmdWifiPickerStart()) {
+        render_requested = true;
+        return;
+    }
+    if (hidden > 0) {
+        cmdAddLine("+%d hidden SSID(s)", hidden);
+    }
     render_requested = true;
 }
 
@@ -1492,6 +1493,141 @@ bool wifiConnectKnownAndSyncClock(bool sync_clock, bool* out_clock_synced = NULL
     return false;
 }
 
+static bool wifiConfigValueStorable(const char* value, bool allow_empty) {
+    if (!value) return false;
+    size_t len = strlen(value);
+    if (!allow_empty && len == 0) return false;
+    if (len > 0 && (value[0] == ' ' || value[0] == '\t' || value[len - 1] == ' ' || value[len - 1] == '\t')) {
+        return false;
+    }
+    if (value[0] == '#') return false;
+    for (const char* p = value; *p; p++) {
+        unsigned char c = (unsigned char)(*p);
+        if (c < 32 || c == 127) return false;
+    }
+    return true;
+}
+
+static bool wifiAddRuntimeAP(const char* ssid, const char* pass, bool* out_full = NULL) {
+    if (out_full) *out_full = false;
+    if (!ssid || ssid[0] == '\0') return false;
+
+    int existing = wifiConfigIndexForSSID(String(ssid));
+    if (existing >= 0) {
+        if (pass && pass[0] != '\0') {
+            strncpy(config_wifi[existing].pass, pass, sizeof(config_wifi[existing].pass) - 1);
+            config_wifi[existing].pass[sizeof(config_wifi[existing].pass) - 1] = '\0';
+        }
+        return true;
+    }
+
+    if (config_wifi_count >= MAX_WIFI_APS) {
+        if (out_full) *out_full = true;
+        return false;
+    }
+
+    strncpy(config_wifi[config_wifi_count].ssid, ssid, sizeof(config_wifi[config_wifi_count].ssid) - 1);
+    config_wifi[config_wifi_count].ssid[sizeof(config_wifi[config_wifi_count].ssid) - 1] = '\0';
+    if (pass && pass[0] != '\0') {
+        strncpy(config_wifi[config_wifi_count].pass, pass, sizeof(config_wifi[config_wifi_count].pass) - 1);
+        config_wifi[config_wifi_count].pass[sizeof(config_wifi[config_wifi_count].pass) - 1] = '\0';
+    } else {
+        config_wifi[config_wifi_count].pass[0] = '\0';
+    }
+    config_wifi_count++;
+    return true;
+}
+
+static bool wifiAppendAPToConfigFile(const char* ssid, const char* pass) {
+    if (!sd_mounted) return false;
+    if (!wifiConfigValueStorable(ssid, false)) return false;
+    const char* pw = pass ? pass : "";
+    if (!wifiConfigValueStorable(pw, true)) return false;
+
+    sdAcquire();
+    File f = SD.open("/CONFIG", FILE_APPEND);
+    if (!f) {
+        sdRelease();
+        return false;
+    }
+
+    bool ok = true;
+    if (f.print("\n# wifi\n") == 0) ok = false;
+    if (ok && f.print(ssid) != strlen(ssid)) ok = false;
+    if (ok && f.print('\n') != 1) ok = false;
+    if (ok && pw[0] != '\0' && f.print(pw) != strlen(pw)) ok = false;
+    if (ok && f.print('\n') != 1) ok = false;
+
+    f.close();
+    sdRelease();
+    return ok;
+}
+
+bool wifiPickerConnectSelectedNetwork(const char* ssid, bool open_network, bool known_network) {
+    if (!ssid || ssid[0] == '\0') {
+        cmdSetResult("WiFi selection invalid");
+        return false;
+    }
+
+    int cfg_idx = known_network ? wifiConfigIndexForSSID(String(ssid)) : -1;
+    if (cfg_idx < 0) cfg_idx = wifiConfigIndexForSSID(String(ssid));
+
+    const char* pass = NULL;
+    bool should_persist_open = false;
+    if (cfg_idx >= 0) {
+        pass = config_wifi[cfg_idx].pass;
+    } else if (open_network) {
+        pass = "";
+        should_persist_open = true;
+    } else {
+        wifi_state = WIFI_FAILED;
+        wifiSetLastFailure(ssid, "missing password");
+        cmdClearResult();
+        cmdAddLine("Need password: %s", ssid);
+        cmdAddLine("Add to /CONFIG and retry");
+        return false;
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFiAttemptResult attempt = wifiTryAP(ssid, pass, WIFI_CONNECT_TIMEOUT_MS);
+    if (!attempt.connected) {
+        char reason[48];
+        wifiFormatFailureReason(attempt, reason, sizeof(reason));
+        wifi_state = WIFI_FAILED;
+        wifiSetLastFailure(ssid, reason);
+        cmdClearResult();
+        cmdAddLine("WiFi fail: %s", ssid);
+        cmdAddLine("Why:%s", reason);
+        return false;
+    }
+
+    wifi_state = WIFI_CONNECTED;
+    wifiClearLastFailure();
+    bool ntp_synced = wifiSyncClockNtp();
+
+    String ip = WiFi.localIP().toString();
+    cmdSetResult("WiFi %s %s NTP:%s", ssid, ip.c_str(), ntp_synced ? "ok" : "fail");
+
+    if (should_persist_open) {
+        bool full = false;
+        bool runtime_added = wifiAddRuntimeAP(ssid, "", &full);
+        bool saved = runtime_added && wifiAppendAPToConfigFile(ssid, "");
+        if (saved) {
+            cmdAddLine("Saved open AP to /CONFIG");
+        } else if (full) {
+            cmdAddLine("Not saved: WiFi list full");
+        } else if (!sd_mounted) {
+            cmdAddLine("Not saved: SD unavailable");
+        } else if (!wifiConfigValueStorable(ssid, false)) {
+            cmdAddLine("Not saved: SSID unsupported");
+        } else {
+            cmdAddLine("Not saved: /CONFIG write failed");
+        }
+    }
+
+    return true;
+}
+
 bool ensureClockForDateDaily() {
     if (timeSyncClockLooksValid()) return true;
     bool ntp_synced = false;
@@ -1541,6 +1677,8 @@ void wifiScanCommand() {
         return;
     }
 
+    cmdPickerStop();
+    cmdWifiPickerResetResults();
     WiFi.mode(WIFI_STA);
     WiFi.scanDelete();
     int scan_start = WiFi.scanNetworks(true /* async */);
@@ -1929,7 +2067,7 @@ bool executeCommand(const char* cmd) {
         if (arg[0] == '\0') {
             cmdEditPickerStart();
         } else {
-            cmdEditPickerStop();
+            cmdPickerStop();
             autoSaveDirty();
             String path = "/" + String(arg);
             if (loadFromFile(path.c_str())) {
@@ -2192,9 +2330,9 @@ bool handleCommandKeyPress(int event_code) {
 
     if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
 
-    if (cmd_edit_picker_active) {
+    if (cmdPickerIsActive()) {
         if (IS_MIC(row, col_rev)) {
-            cmdEditPickerStop();
+            cmdPickerStop();
             app_mode = cmd_return_mode;
             return false;
         }
@@ -2204,15 +2342,13 @@ bool handleCommandKeyPress(int event_code) {
 
         char base = keymap_lower[row][col_rev];
         if (base == 0) return false;
-        if (base == 'w') return cmdEditPickerMoveSelection(-1);
-        if (base == 's') return cmdEditPickerMoveSelection(1);
-        if (base == 'a') return cmdEditPickerPage(-1);
-        if (base == 'd') return cmdEditPickerPage(1);
-        if (base == '\n') return cmdEditPickerOpenSelected();
+        if (base == 'w') return cmdPickerMoveSelection(-1);
+        if (base == 's') return cmdPickerMoveSelection(1);
+        if (base == 'a') return cmdPickerPage(-1);
+        if (base == 'd') return cmdPickerPage(1);
+        if (base == '\n') return cmdPickerOpenSelected();
         if (base == '\b') {
-            cmdEditPickerStop();
-            cmdSetResult("Edit cancelled");
-            return true;
+            return cmdPickerCancel();
         }
         return false;
     }
@@ -2305,8 +2441,9 @@ void renderCommandPrompt() {
         // Draw prompt line at bottom of command area (above status bar)
         int py = SCREEN_H - STATUS_H - CHAR_H - 2;
         display.setCursor(MARGIN_X, py);
-        if (cmd_edit_picker_active) {
-            display.print("> edit");
+        if (cmdPickerIsActive()) {
+            display.print("> ");
+            display.print(cmdPickerPromptWord());
         } else {
             display.print("> ");
             display.print(cmd_buf);
@@ -2357,8 +2494,8 @@ void renderCommandPrompt() {
             snprintf(status_left, sizeof(status_left), "%s", dl);
         } else if (shortcut_running) {
             snprintf(status_left, sizeof(status_left), "[RUN] shortcut...");
-        } else if (cmd_edit_picker_active) {
-            snprintf(status_left, sizeof(status_left), "[PICK] W/S move A/D page Enter");
+        } else if (cmdPickerIsActive()) {
+            snprintf(status_left, sizeof(status_left), "%s", cmdPickerStatusHint());
         } else {
             status_left[0] = '\0';
             show_runtime = true;
