@@ -1,6 +1,8 @@
 # s-term
 
-Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, WireGuard support, and BLE/GPS/4G/Meshtastic-radio features.
+Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, WireGuard support, and BLE/GPS/4G/Meshtastic-radio features. 
+
+**IN DEVELOPMENT!** Many features may break or change!
 
 ## Overview
 - Default mode is a keyboard-driven notepad rendered on the e-ink panel. Files can be saved to the SD card.
